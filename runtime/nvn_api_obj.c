@@ -334,8 +334,11 @@ NVN_API(nvnTextureReadTexelsStrided) { read_texels(c, 1); }
 NVN_API(nvnTextureWriteTexels) { write_texels(c, 0); }
 NVN_API(nvnTextureWriteTexelsStrided) { write_texels(c, 1); }
 // void nvnTexture{Flush,Invalidate}Texels(const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r): texel
-// access is coherent
-NVN_API(nvnTextureFlushTexels) { (void)c; }
+// access is coherent; flush marks the storage as written for re-upload
+NVN_API(nvnTextureFlushTexels) {
+    const tex_t *t = arg_p(c, 0);
+    if (t && t->mem && !nvn_gpu_only((uintptr_t)t->mem)) nvn_guest_written((uintptr_t)t->mem, t->L.size);
+}
 NVN_API(nvnTextureInvalidateTexels) { (void)c; }
 
 // ---------- Samplers
