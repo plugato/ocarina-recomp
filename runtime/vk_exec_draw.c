@@ -1005,7 +1005,7 @@ static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, 
             // it was copied back every submission and uploaded again, 3.2 GB a frame. Bound whole for reads; 8 MiB count as written,
             // the cap Lichii and oot-pc-recomp use. ponytail: a store past it stays in the mirror and is not seen by the CPU.
             uint64_t wrote = direct_only && n > WRITTEN_CAP ? WRITTEN_CAP : n;
-            if (written) vk_mem_gpu_wrote(&sp, wrote), vk_usnap_drop(addr, wrote);
+            if (written) vk_mem_gpu_wrote_shader(&sp, wrote), vk_usnap_drop(addr, wrote);
         }
         count_use(sp.cls, use, n);
         VK_MEM_BOUND(sp);
