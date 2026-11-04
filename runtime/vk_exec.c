@@ -1029,6 +1029,10 @@ static int record_impl(VkCommandBuffer cb, const uint64_t *handles, int n, uint6
                        VkExecWorkFn work, void *context) {
     VkExec *ex = &X;
     if (!x_ready) state_reset(ex), vk_dump_init(), x_ready = 1;
+    const tex_t *keep[9];   // the render targets carry over to this submission (set_rt compares them by pointer)
+    memcpy(keep, ex->rt.color, sizeof ex->rt.color);
+    keep[8] = ex->rt.depth;
+    nvn_pins_sweep(nvn_submit_count(), keep, 9);
     ex->cb = cb;
     vk_prof_mark(ex, "part", 1);
     ex->fence = fence;
