@@ -3472,19 +3472,30 @@ VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
         Layout *l = compute_layout(cs, &B, &why);
         VkPipeline pipe = VK_NULL_HANDLE;
         if (!why) {
+            // The driver compile runs without P.lock, as lb_compute does: holding it stalled every other pipeline lookup
+            // (graphics draws on the replay thread, the prebuild workers) for the whole compile, a visible hitch.
+            plat_mutex_unlock(&P.lock);
             uint64_t p0 = perf_begin();
             pipe = compute_create(cs, l);
             perf_end(PERF_PIPE, p0);
-            if (!pipe) why = "pipeline creation failed";
+            plat_mutex_lock(&P.lock);
+            Pipe *other = pipe_find(&k, sizeof k, h);   // a prebuild worker finished the same pipeline meanwhile
+            if (other) {
+                if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
+                p = other;
+                P.stats.hits++;
+            } else if (!pipe) why = "pipeline creation failed";
         }
-        if (why) {
-            P.stats.failures++;
-            rt_log("vk_pipeline: compute pipeline not built: %s", why);
-        } else {
-            P.stats.compute++;
-            LB.cs_draw++;
+        if (!p) {
+            if (why) {
+                P.stats.failures++;
+                rt_log("vk_pipeline: compute pipeline not built: %s", why);
+            } else {
+                P.stats.compute++;
+                LB.cs_draw++;
+            }
+            p = pipe_add(&k, sizeof k, h, pipe, l, l ? &B : NULL, VK_PIPELINE_BIND_POINT_COMPUTE, 0);
         }
-        p = pipe_add(&k, sizeof k, h, pipe, l, l ? &B : NULL, VK_PIPELINE_BIND_POINT_COMPUTE, 0);
     }
     plat_mutex_unlock(&P.lock);
     if (!p) return VK_NULL_HANDLE;
