@@ -97,8 +97,8 @@ def verify_vendor() -> None:
 
 def selected_patches(*, defined_float_minmax: bool = False) -> list[Path]:
     patches = sorted((XLATE / "patches").glob("*.patch"))
-    if len(patches) != 38:
-        sys.exit(f"expected 38 patches, found {len(patches)}")
+    if len(patches) != 39:
+        sys.exit(f"expected 39 patches, found {len(patches)}")
     optional = XLATE / "patches" / DEFINED_FLOAT_MINMAX_PATCH
     if optional not in patches:
         sys.exit(f"missing optional patch: {DEFINED_FLOAT_MINMAX_PATCH}")
@@ -107,6 +107,9 @@ def selected_patches(*, defined_float_minmax: bool = False) -> list[Path]:
 
 def prepare_sources(*, defined_float_minmax: bool = False) -> Path:
     src = BUILD / "ryujinx"
+    if not VENDOR.is_dir():   # the Windows setup ZIP leaves the sources out: it ships the translator built (issue #41)
+        sys.exit(f"{VENDOR} is missing. The projeto folder of the Windows setup ZIP has no translator sources: "
+                 "build from a clone instead, git clone https://github.com/sostenesfreitas/ocarina-recomp")
     if BUILD.exists():
         shutil.rmtree(BUILD / "ryujinx", ignore_errors=True)
     shutil.copytree(VENDOR, src)

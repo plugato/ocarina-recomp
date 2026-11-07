@@ -70,8 +70,22 @@ static void uniform_branch_boundary() {
     CHECK(capture.Observe(exit_op(),3)==ProgramCaptureState::Result::Complete);
 }
 
+// A per-tap gather (TLD4.PTP) whose packed offsets in R16, R17 are not immediates (an S2R here)
+// lowers anyway: the offsets go to R248, R249 by register move and the translator splits the gather.
+static void per_tap_runtime_offsets() {
+    auto s2r=op(0x919);bits(s2r,16,8,16);
+    auto mov=op(0x202);bits(mov,16,8,17);bits(mov,32,8,16);bits(mov,72,4,15);
+    const std::vector<Instruction> code{s2r,mov,Instruction{{0x06187b63U,0x30007c10,0x001e2f0eU,0}},exit_op()};
+    auto lowered=LowerToMaxwell(code);
+    CHECK(bool(lowered));
+    unsigned moves=0;
+    for(const u64 insn:lowered.instructions)
+        for(u64 i=0;i<2;i++) moves+=insn==(0x5c98000000000000ULL|(7ULL<<16)|(248+i)|(15ULL<<39)|((16+i)<<20));
+    CHECK(moves==2);
+}
+
 int main() {
-    predicate_matrix();pending_call_boundary();uniform_branch_boundary();
+    predicate_matrix();pending_call_boundary();uniform_branch_boundary();per_tap_runtime_offsets();
     std::printf("native EXIT capture: %u checks, %u failures\n",checks,failures);
     return failures?1:0;
 }

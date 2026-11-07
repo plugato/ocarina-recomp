@@ -1,12 +1,12 @@
 // ASTC textures on the GPU: the TOTK_ASTC knob, a compute decoder that turns raw blocks into the RGBA8 image the CPU
 // decoder (tex_astc.c) would have written, and the native ASTC formats where the device samples them itself.
 //
-// TOTK_ASTC_BC = 1 (gpu mode only, default 0): a second pass (runtime/shaders/bc3_encode.comp) encodes the decoded
-// texels to BC3 and the image is BC3, 8 bits per texel instead of 32. For GPUs with little video memory, at the cost of
+// TOTK_ASTC_BC = 1 (gpu mode only, default: by VRAM size): a second pass (runtime/shaders/bc3_encode.comp) encodes the decoded
+// texels to BC3 and the image is BC3, 8 bits per texel instead of 32. Unset: on with 6 GiB of VRAM or less. For GPUs with little video memory, at the cost of
 // BC3's quality: textures look slightly blockier, and data textures (normal maps) lose some precision.
 //
 // TOTK_ASTC = auto (default): native when the device reports textureCompressionASTC_LDR and the format's features,
-// else gpu. gpu: compute decode into RGBA8 (runtime/shaders/astc_decode.comp). native: like auto, but logs when the
+// else cpu on an integrated GPU and gpu otherwise. gpu: compute decode into RGBA8 (runtime/shaders/astc_decode.comp). native: like auto, but logs when the
 // device cannot. cpu: astc_decode_ldr_mt on the uploading thread, as before. check: gpu, and every upload is also
 // decoded on the CPU and compared (waits for the GPU; for testing only).
 //
@@ -298,20 +298,19 @@ static int create_pipeline(VkCtx *c) {
 }
 
 // TOTK_ASTC_BC=1: the BC3 encoder, when the device samples BC3 (every desktop GPU does); 0 leaves ASTC as RGBA8.
-// Unset: on when the largest device-local heap is under 5 GiB. There RGBA8 ASTC, four times the size of BC3, fills
-// video memory (a GTX 1650 4 GiB went from 10-23 to 3-12 ms of GPU time a frame, issue #87); BC3 loses some precision
-// (normal maps), so GPUs with more memory keep RGBA8.
+// Unset: on when the largest device-local heap is 6 GiB or less. On a GTX 1650 (4 GiB) a new area decoded 940 M
+// texels of ASTC into RGBA8 (3.7 GB), the heap reached 6.1 GB of a 3.3 GB budget and the device was lost.
 static int create_bc_pipeline(VkCtx *c) {
     const char *e = cfg_get("TOTK_ASTC_BC");
-    VkDeviceSize vram = 0;
-    for (uint32_t h = 0; h < c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
-        if (c->mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT && c->mem_props.memoryHeaps[h].size > vram)
-            vram = c->mem_props.memoryHeaps[h].size;
-    int on = e && *e ? *e != '0' : vram < (5ull << 30);
-    if (!(e && *e))
-        rt_log("vk: TOTK_ASTC_BC unset: BC3 %s (largest device-local heap %llu MiB)", on ? "on" : "off",
-               (unsigned long long)(vram >> 20));
-    if (!on) return 0;
+    if (e && *e && *e == '0') return 0;
+    if (!e || !*e) {
+        VkDeviceSize heap = 0;
+        for (uint32_t h = 0; h < c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
+            if (c->mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT && c->mem_props.memoryHeaps[h].size > heap)
+                heap = c->mem_props.memoryHeaps[h].size;
+        if (!heap || heap > (6ull << 30)) return 0;
+        rt_log("vk: %.1f GiB of VRAM: ASTC textures are encoded to BC3 (TOTK_ASTC_BC=0 keeps RGBA8)", (double)heap / (1u << 30));
+    }
     VkFormatProperties p;
     vkGetPhysicalDeviceFormatProperties(c->phys, VK_FORMAT_BC3_SRGB_BLOCK, &p);
     VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
@@ -362,6 +361,9 @@ int vk_astc_mode(void) {
         else {
             if (want == VK_ASTC_NATIVE) rt_log("vk: TOTK_ASTC=native: the device lacks textureCompressionASTC_LDR; gpu");
             m = want == VK_ASTC_CPU ? VK_ASTC_CPU : want == VK_ASTC_CHECK ? VK_ASTC_CHECK : VK_ASTC_GPU;
+            // auto on an integrated GPU: the CPU. On an Intel Arc 140V the first load of Kokiri Forest decoded about
+            // 780 million texels on the GPU in one go and the device was lost (past Windows' 2 s TDR); on the CPU it loads.
+            if (want == -1 && c->props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) m = VK_ASTC_CPU;
         }
         if ((m == VK_ASTC_GPU || m == VK_ASTC_CHECK || m == VK_ASTC_NATIVE) && !G.pipe && !G.failed &&
             !create_pipeline(c)) {

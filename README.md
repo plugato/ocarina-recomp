@@ -100,6 +100,7 @@ Leva de 30 minutos a 2 horas, e você pode usar o PC enquanto isso. Para atualiz
 - Windows 10 ou 11 de 64 bits, com processador compatível com AVX2.
 - Placa de vídeo com Vulkan 1.3 e mesh shaders, com o driver atualizado. Recomendamos NVIDIA.
 - Recomendamos 16 GB de RAM ou mais. Com menos, nunca testamos: a compilação ou o jogo podem falhar.
+- Com 16 GB de RAM, aumente o arquivo de paginação do Windows antes de jogar (inicial 16384 MB, máximo 32768 MB): na primeira vez o jogo pode chegar a uns 24 GB de memória, e o Windows fecha o jogo se passar do limite. O instalador avisa quando o limite é baixo.
 - 40 GB livres com o instalador em ZIP. Nos outros dois jeitos, 60 GB, mais uns 15 GB no disco C: para as ferramentas.
 - Internet durante a instalação.
 - **Sua cópia do jogo na versão 1.1.1.** Outras versões não funcionam.
@@ -110,6 +111,7 @@ Leva de 30 minutos a 2 horas, e você pode usar o PC enquanto isso. Para atualiz
 |---|---|
 | "Este jogo não é a versão 1.1.1" | Confira se escolheu o jogo certo e atualizado |
 | O jogo abre e fecha | Atualize o driver da placa de vídeo e veja o arquivo `ultima-partida-erros.log` na pasta de instalação |
+| O jogo fechou no meio | O log de cada partida fica guardado em `logs\` (as últimas 10). `jogar\medir-partida.ps1` mostra o crash e o desempenho. |
 | Travadinhas na primeira vez | É normal: os shaders estão sendo preparados. Melhora quando você passa de novo pelo mesmo lugar |
 
 Se continuar, [abra uma issue](https://github.com/sostenesfreitas/ocarina-recomp/issues) com a mensagem de erro e o modelo da sua placa de vídeo. Nunca envie arquivos do jogo.

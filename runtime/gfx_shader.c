@@ -100,6 +100,7 @@ struct GfxShader {
     GfxShaderRes *res[GFX_RES_KINDS];
     int nres[GFX_RES_KINDS];
     uint32_t in_mask, out_mask;                            // user Locations of Input / Output variables
+    uint8_t out_comps[32];                                 // FS: components each output Location writes (reflect_out_comps)
     GfxShaderIo in[32], out[32];
     uint32_t local[3];
     GfxShaderGeometry geometry;
@@ -974,6 +975,70 @@ static int geometry_spirv(const GfxShader *s) {
     return !gs || (entry && capability && modes == 15);
 }
 
+// FS output Location l: the components (bit c = component c) the module ever stores, in out_comps[l]; 0xf when it cannot
+// tell. Maxwell leaves the channels a fragment shader does not write as they were, whatever the channel mask; Vulkan
+// writes undefined values there (zeros on NVIDIA). The pass that builds the 320x180 lighting target in Kokiri Forest
+// writes only its blue and alpha and keeps red and green from before: zeroed, the falling leaves, the canopy and the
+// grass lost their sunlight and rendered black (vk_pipeline.c target_wmask masks the channels). The translator declares
+// each output as a vec4 and stores single components through an OpAccessChain with a constant index; any other store
+// to an output (the whole vector, a dynamic index, a pointer passed on or copied) counts as all four.
+static void reflect_out_comps(GfxShader *s) {
+    enum { OP_VARIABLE_ = 59, OP_CONSTANT_ = 43, OP_DECORATE_ = 71, OP_STORE = 62, OP_ACCESS = 65, OP_IN_BOUNDS = 66,
+           OP_LOAD = 61, OP_NAME = 5, OP_ENTRY = 15, DEC_LOCATION = 30, DEC_COMPONENT = 31, SC_OUT = 3 };
+    memset(s->out_comps, 0xf, sizeof s->out_comps);
+    if (s->stage != GFX_STAGE_FS || s->words < 5) return;
+    const uint32_t *w = s->spirv;
+    uint64_t n = s->words;
+    uint32_t bound = w[3] < (1u << 20) ? w[3] : (1u << 20);
+    // per id: location + 1 of an output variable, or of the variable a single-component chain points into; that
+    // component + 1 for a chain (0: the whole variable); constant values; a Component decoration
+    int32_t *loc = calloc(bound, sizeof *loc), *vloc = calloc(bound, sizeof *vloc);
+    uint8_t *comp = calloc(bound, 1), *has_comp_dec = calloc(bound, 1);
+    uint32_t *cval = calloc(bound, sizeof *cval);
+    uint8_t *cknown = calloc(bound, 1);
+    uint8_t wr[32] = {0};
+    if (!loc || !vloc || !comp || !has_comp_dec || !cval || !cknown) goto out;
+    for (uint64_t i = 5; i < n;) {   // decorations, constants, output variables
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) goto out;
+        const uint32_t *a = w + i + 1;
+        if (op == OP_DECORATE_ && len >= 4 && a[0] < bound && a[1] == DEC_LOCATION) loc[a[0]] = (int32_t)a[2] + 1;
+        else if (op == OP_DECORATE_ && len >= 3 && a[0] < bound && a[1] == DEC_COMPONENT) has_comp_dec[a[0]] = 1;
+        else if (op == OP_CONSTANT_ && len == 4 && a[1] < bound) cval[a[1]] = a[2], cknown[a[1]] = 1;
+        else if (op == OP_VARIABLE_ && len >= 4 && a[1] < bound && a[2] == SC_OUT && loc[a[1]] > 0 && loc[a[1]] <= 32 &&
+                 !has_comp_dec[a[1]])
+            vloc[a[1]] = loc[a[1]];
+        i += len;
+    }
+    for (uint64_t i = 5; i < n;) {   // chains into outputs, stores through them
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        const uint32_t *a = w + i + 1;
+        if ((op == OP_ACCESS || op == OP_IN_BOUNDS) && len >= 4 && a[1] < bound && a[2] < bound && vloc[a[2]] > 0) {
+            vloc[a[1]] = vloc[a[2]];
+            comp[a[1]] = len == 5 && a[3] < bound && cknown[a[3]] && cval[a[3]] < 4 ? (uint8_t)(cval[a[3]] + 1) : 0;
+        } else if (op == OP_STORE && len >= 3 && a[0] < bound && vloc[a[0]] > 0) {
+            wr[vloc[a[0]] - 1] |= comp[a[0]] ? (uint8_t)(1u << (comp[a[0]] - 1)) : 0xf;
+        } else if (op != OP_LOAD && op != OP_DECORATE_ && op != OP_NAME && op != OP_ENTRY && op != OP_VARIABLE_ &&
+                   op != OP_STORE && op != OP_ACCESS && op != OP_IN_BOUNDS) {
+            // any other instruction that names an output pointer (a call, a copy, OpPhi of pointers): all components
+            for (uint32_t k = 0; k + 1 < len; k++)
+                if (a[k] < bound && vloc[a[k]] > 0) wr[vloc[a[k]] - 1] = 0xf;
+        }
+        i += len;
+    }
+    for (int l = 0; l < 32; l++)
+        if (s->out_mask >> l & 1) {
+            s->out_comps[l] = wr[l] ? wr[l] : 0xf;
+            static volatile int32_t logged;
+            if (s->out_comps[l] != 0xf && __atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 12)
+                rt_log("gfx_shader: fragment output %d writes only channels %s%s%s%s: the others keep their value", l,
+                       s->out_comps[l] & 1 ? "r" : "", s->out_comps[l] & 2 ? "g" : "", s->out_comps[l] & 4 ? "b" : "",
+                       s->out_comps[l] & 8 ? "a" : "");
+        }
+out:
+    free(loc), free(vloc), free(comp), free(has_comp_dec), free(cval), free(cknown);
+}
+
 // Interface Locations and the compute workgroup size from the module. Ids beyond 2^20 are ignored (Ryujinx modules stay
 // far below).
 static void reflect_spirv(GfxShader *s) {
@@ -1135,7 +1200,7 @@ static int reflect(GfxShader *s, int flags) {
                 if (*q++ != (i + 1 == n ? ']' : ',')) return 0;
             }
         }
-        if (!nvn2_c0_valid(&s->c0, NVN2_C0_BYTES)) return 0;
+        if (!nvn2_c0_valid(&s->c0, NVN2_C0_LIST)) return 0;   // the same bound the dispatch packs against, so a bad layout fails here
         s->has_c0 = 1;
     }
     if (require_c0 && !s->has_c0) {
@@ -1161,6 +1226,7 @@ static int reflect(GfxShader *s, int flags) {
             return 0;
         }
     reflect_spirv(s);
+    reflect_out_comps(s);
     if (s->geometry_source_passthrough) {
         if (s->geometry_position != 3) return 0;
         uint32_t locations = 0;
@@ -2370,6 +2436,7 @@ uint32_t gfx_shader_outputs(const GfxShader *s, GfxShaderIo io[32]) {
     return s->out_mask;
 }
 
+uint32_t gfx_shader_output_comps(const GfxShader *s, int loc) { return loc >= 0 && loc < 32 ? s->out_comps[loc] : 0xf; }
 int gfx_shader_is_mesh(const GfxShader *s) { return s->is_mesh; }
 int gfx_shader_is_task(const GfxShader *s) { return s->is_task; }
 void gfx_shader_local_size(const GfxShader *s, uint32_t local[3]) { memcpy(local, s->local, sizeof s->local); }
@@ -2594,6 +2661,14 @@ void gfx_shader_record_at(const char *keys_path) {
     plat_mutex_unlock(&RC.lock);
 }
 
+// One shader-programs.bin record: what play writes (ans_note) and what --lower-stages writes (gfx_shader_lower_stages).
+static void prg_put(Bytes *b, uint32_t st, const uint8_t *control, const uint8_t *code, const Req *r) {
+    uint32_t head[3] = {st, r->length, r->c1_len};
+    bytes_put(b, head, 12), bytes_put(b, r->code_hash, 32);
+    bytes_put(b, control, CONTROL_SIZE), bytes_put(b, code, r->length);
+    bytes_put(b, r->c1, r->c1_len);
+}
+
 // A get resolved (r, a) to s: queue the record when its input id is new, and its program when new. Cost: a set
 // lookup under a lock per call; gets happen per (program, answers) change in vk_exec_draw's shader table, not per draw.
 static void ans_note(const Req *r, int stage, const uint8_t *control, const uint8_t *code, const GfxShaderAnswers *a,
@@ -2606,16 +2681,62 @@ static void ans_note(const Req *r, int stage, const uint8_t *control, const uint
         uint8_t rec[ANS_REC] = {0};
         memcpy(rec, &st, 4), memcpy(rec + 4, r->code_hash, 32), memcpy(rec + 36, s->iid, 32);
         pack_geometry_answers(rec + 68, a);
-        if (set_add(&RC.progs, hash8(r->code_hash))) {
-            uint32_t head[3] = {st, r->length, r->c1_len};
-            bytes_put(&RC.prg, head, 12), bytes_put(&RC.prg, r->code_hash, 32);
-            bytes_put(&RC.prg, control, CONTROL_SIZE), bytes_put(&RC.prg, code, r->length);
-            bytes_put(&RC.prg, r->c1, r->c1_len);
-        }
+        if (set_add(&RC.progs, hash8(r->code_hash))) prg_put(&RC.prg, st, control, code, r);
         bytes_put(&RC.ans, rec, sizeof rec);
         RC.pairs_new++;
     }
     plat_mutex_unlock(&RC.lock);
+}
+
+// ocarina.exe --lower-stages <pack> <dir>: the raw NVN 2 stages tools/oot/shader_extract.py --pack takes from the
+// player's RomFS, lowered as nvnProgramSetShaders does (nvn_api_obj.c), into <dir>/seed-programs.bin, the program
+// records play would write for them, so --prepare-shaders needs no play to know the programs. Pack: "OOTSTGPK",
+// version 1, count; per stage control size, code size, control, code. Geometry stages are left out: their code hash
+// takes the input primitive from a draw's answers (build_code_hash), and their control the varyings of the program's
+// other stages (vk_exec_draw.c native_gs_control). Tessellation control stages are not translated (shader_for).
+int gfx_shader_lower_stages(const char *pack, const char *dir) {
+    double t0 = plat_now_ms();
+    uint64_t size = 0;
+    uint8_t *f = read_file(pack, &size);
+    uint32_t count = 0;
+    if (!f || size < 16 || memcmp(f, "OOTSTGPK\1\0\0\0", 12)) {
+        fprintf(stderr, "lower-stages: %s is not a stage pack (tools/oot/shader_extract.py --pack)\n", pack);
+        return free(f), 2;
+    }
+    memcpy(&count, f + 12, 4);
+    Bytes out = {0};
+    Set64 seen = {0};
+    RecHeader h = {{'T','O','T','K','S','P','R','G'}, PRG_VERSION, 0};
+    bytes_put(&out, &h, sizeof h);
+    uint32_t n = 0, failed = 0, skipped = 0, dup = 0;
+    for (uint64_t o = 16; n < count && size - o >= 8; n++) {
+        uint32_t csz, len;
+        memcpy(&csz, f + o, 4), memcpy(&len, f + o + 4, 4);
+        if (size - o - 8 < (uint64_t)csz + len) break;
+        const uint8_t *ctl = f + o + 8, *code = ctl + csz, *nctl, *ncode;
+        o += 8 + (uint64_t)csz + len;
+        if (!gfx_shader_is_nvn2(ctl) || !nvn2_lower(ctl, code, &nctl, &ncode)) { failed++; continue; }
+        uint32_t nst, c1_off;
+        memcpy(&nst, nctl + 0x714, 4), memcpy(&c1_off, nctl + 0x700, 4);
+        int st = nst == 0 || nst == 4 ? GFX_STAGE_VS : nst == 1 ? GFX_STAGE_FS : nst == 5 ? GFX_STAGE_CS : -1;
+        Req r = {.stage = st};
+        memcpy(&r.length, nctl + 0x704, 4);
+        r.c1_len = r.length - c1_off, r.c1 = ncode + c1_off;
+        if (st < 0 || c1_off > r.length ||
+            !build_code_hash(st, nctl, ncode, r.length, r.c1, r.c1_len, 0, r.code_hash)) { skipped++; continue; }
+        if (!set_add(&seen, hash8(r.code_hash))) { dup++; continue; }
+        prg_put(&out, (uint32_t)st, nctl, ncode, &r);
+    }
+    free(f), free(seen.v);
+    char path[PATH_CAP];
+    snprintf(path, sizeof path, "%s/seed-programs.bin", dir);
+    mkdir_p(dir);
+    int ok = n == count && plat_file_write_atomic(path, out.p, out.n);
+    printf("lower-stages: %u of %u stages read, %u programs (%zu MiB) to %s, %u did not lower, %u geometry or "
+           "tessellation control skipped, %u duplicates, in %.0f ms\n", n, count, seen.n, out.n >> 20, path, failed,
+           skipped, dup, plat_now_ms() - t0);
+    free(out.p);
+    return ok ? 0 : 1;
 }
 
 static int rec_append(const char *path, const char *magic, uint32_t version, uint32_t rec_size, const Bytes *b) {

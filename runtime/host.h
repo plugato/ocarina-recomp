@@ -322,4 +322,5 @@ int probe_vkreset(void);                                  // vk_reset_probe.c: o
 int probe_vkclear(void);                                                  // vk_clear_probe.c
 int probe_movie(void);                                     // movie_probe.c: host VP9 movie::Decoder on one RomFS movie
 int vk_pipeline_prepare_shaders(void);                     // vk_pipeline.c: --prepare-shaders (tools/prepare_shaders.py)
+int gfx_shader_lower_stages(const char *pack, const char *dir);   // gfx_shader.c: --lower-stages (shader_extract.py --pack)
 int vk_pipeline_warm_shaders(void);                        // vk_pipeline.c: --warm-shaders (tools/build_game.py)

@@ -263,10 +263,24 @@ function AtualizarPath() {
 }
 # ---- os passos: nome, minutos estimados e o que fazem
 function P-Copiar() {
+    # Ninja compares dates: every ZIP gives runtime\cpu.h a new one, and an update recompiled all 660 objects of the game
+    # (about an hour on a slow PC) with no header changed. A runtime file the update leaves byte-identical gets its old
+    # date back; a changed one gets now, since the ZIP's date can be older than the last build.
+    $rt = Join-Path $script:pasta 'runtime'
+    $antes = @{}
+    if (Test-Path -LiteralPath $rt) {
+        Get-ChildItem -LiteralPath $rt -Recurse -File | ForEach-Object { $antes[$_.FullName] = @((Get-FileHash -LiteralPath $_.FullName -Algorithm MD5).Hash, $_.LastWriteTimeUtc) }
+    }
     # robocopy: fewer than 8 is success. /MIR on the project would delete the game's build output, so it only adds and replaces.
     foreach ($par in @(@('projeto', $script:pasta), @('ferramentas', (Join-Path $script:pasta 'ferramentas')))) {
         $cod = Exec 'robocopy.exe' @((Join-Path $SETUP $par[0]), $par[1], '/E', '/NFL', '/NDL', '/NJH', '/NJS', '/NP', '/R:2', '/W:2') -PodeFalhar
         if ($cod -ge 8) { throw (L "Não consegui copiar os arquivos para $($script:pasta)." "Could not copy the files to $($script:pasta).") }
+    }
+    $agora = [DateTime]::UtcNow
+    foreach ($k in $antes.Keys) {
+        if (-not (Test-Path -LiteralPath $k)) { continue }
+        $f = Get-Item -LiteralPath $k
+        $f.LastWriteTimeUtc = if ((Get-FileHash -LiteralPath $k -Algorithm MD5).Hash -eq $antes[$k][0]) { $antes[$k][1] } else { $agora }
     }
     AtualizarPath
     $script:py = Ferramenta 'python\python.exe'
@@ -321,9 +335,43 @@ function P-Romfs() {
     }
 }
 function P-Exe() {
+    # A new version recompiles the runtime: the copied sources keep the ZIP's dates, which can be older than the last build's
+    # objects, and Ninja then kept a runtime that did not match the new generated code (FATAL: cfg: ... no row).
+    $versao = (Get-Content -LiteralPath (Join-Path $script:pasta 'VERSION') -Raw).Trim()
+    $marca = Build 'oot111\versao-compilada.txt'
+    $antes = if (Test-Path -LiteralPath $marca) { (Get-Content -LiteralPath $marca -Raw).Trim() } else { '' }
+    if ($antes -ne $versao) {
+        $objRt = Build 'oot111\obj\runtime'
+        if (Test-Path -LiteralPath $objRt) { Registrar "versão ${antes} -> ${versao}: o runtime é recompilado"; Remove-Item -LiteralPath $objRt -Recurse -Force }
+    }
     $ramGb = [Math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
     $jobs = [Math]::Max(2, [Math]::Min([Environment]::ProcessorCount, [int]($ramGb / 3)))
     Exec $script:py @('tools\build_game.py', '--version', 'oot111', '--gen', 'generated\oot111', '--out', (Build 'oot111'), '--expected', 'tools\data\expected-oot111.json', '--exefs', (Build 'exefs'), '--romfs', (Build 'romfs'), '--jobs', "$jobs", '--toolchain', (Ferramenta 'llvm'), '--deps', (Ferramenta 'deps'), '--ninja', (Ferramenta 'bin\ninja.exe')) | Out-Null
+    Set-Content -LiteralPath $marca -Value $versao -Encoding ascii
+}
+# Shader preparation: the player's own shaders, extracted from the game files, lowered and translated for the variants
+# our seed lists (tools/data/oot-seed, answers and pipeline keys recorded in play), so a first start does not stop to
+# build them. Not needed to play: if it fails, the game still works and builds them as before.
+function P-Shaders() {
+    $seed = Join-Path $script:pasta 'tools\data\oot-seed'
+    $dir = Build 'oot111'
+    if (-not (Test-Path (Join-Path $seed 'seed-answers.bin'))) { Registrar 'shaders: sem semente, passo pulado'; return }
+    if (Test-Path (Join-Path $dir 'shader-prepared.bin')) { return }
+    $pack = Build 'shader-stages.pack'
+    $exe = Join-Path $dir 'ocarina.exe'
+    try {
+        Exec $script:py @('-I', 'tools\oot\shader_extract.py', '--romfs-image', (Build 'romfs\romfs.bin'), '--index', (Build 'romfs\index.json'), '--pack', $pack) | Out-Null
+        Exec $exe @('--lower-stages', $pack, $dir) | Out-Null
+        Copy-Item -LiteralPath (Join-Path $seed 'seed-answers.bin') -Destination (Join-Path $dir 'seed-answers.bin') -Force
+        # the player's own keys, from earlier play, are kept
+        if (-not (Test-Path (Join-Path $dir 'pipeline-keys.bin'))) { Copy-Item -LiteralPath (Join-Path $seed 'pipeline-keys.bin') -Destination (Join-Path $dir 'pipeline-keys.bin') }
+        Exec $exe @('--prepare-shaders') | Out-Null
+    } catch {
+        if ("$($_.Exception.Message)" -eq 'CANCELADO') { throw }
+        Registrar "shaders: a preparação falhou, o jogo monta os shaders ao jogar: $($_.Exception.Message)"
+    } finally {
+        foreach ($f in $pack, (Join-Path $dir 'seed-programs.bin')) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
+    }
 }
 function P-Finalizar() {
     $ini = Build 'oot111\totk.ini'
@@ -344,6 +392,7 @@ function Passos() { return @(
     @((L 'Converter o código do jogo' 'Convert the game code'), 2, 'P-Gerar'),
     @((L 'Preparar os arquivos do jogo (pode levar mais de 1 hora em HD)' 'Prepare the game files (can take over 1 hour on a hard drive)'), 25, 'P-Romfs'),
     @((L 'Compilar o jogo (a parte mais demorada)' 'Build the game (the longest part)'), 35, 'P-Exe'),
+    @((L 'Preparar os shaders (evita travadas na primeira vez)' 'Prepare the shaders (avoids stutter the first time)'), 3, 'P-Shaders'),
     @((L 'Criar o atalho' 'Create the shortcut'), 1, 'P-Finalizar')
 ) }
 
@@ -482,10 +531,19 @@ $script:jogo = $null; $script:jogoNup = $false; $script:nupOpcoes = @('--overlay
 $script:pasta = if ($env:OCARINA_PASTA) { $env:OCARINA_PASTA } else { PastaPadrao }
 if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { $script:avisos += (L 'Este instalador só funciona em Windows de 64 bits.' 'This installer only works on 64-bit Windows.'); $script:bloqueio = $true }
 $ram = [Math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+# Commit limit (RAM plus page file): on a first start the game commits about 24 GB (its 9 GB of console memory, the
+# driver's backing for video memory, shader builds). Windows closes it when the limit is lower: a 16 GB PC with the
+# page file the system manages (issue #72, limit 19.6 GB) froze and closed at the Deku Tree scene.
+$commitGb = [Math]::Round((Get-CimInstance Win32_OperatingSystem).TotalVirtualMemorySize / 1MB)
+if ($commitGb -lt 26) { $script:avisos += (L "O Windows deixa usar até $commitGb GB de memória (RAM + arquivo de paginação) e o jogo pode precisar de uns 24 GB na primeira vez. Aumente o arquivo de paginação: Configurações avançadas do sistema > Desempenho > Avançado > Memória virtual > Alterar > tamanho personalizado, inicial 16384 MB e máximo 32768 MB, e reinicie o PC." "Windows allows up to $commitGb GB of memory (RAM + page file) and the game may need about 24 GB the first time. Enlarge the page file: Advanced system settings > Performance > Advanced > Virtual memory > Change > custom size, initial 16384 MB and maximum 32768 MB, then restart the PC.") }
 if ($ram -lt 15) { $script:avisos += (L "Este PC tem $ram GB de RAM. Com menos de 16 GB, nunca testamos: a compilação ou o jogo podem falhar." "This PC has $ram GB of RAM. We never tested with less than 16 GB: the build or the game may fail.") }
 $gpus = (Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }) -join ', '
 Add-Type -Namespace Ocarina -Name Cpu -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool IsProcessorFeaturePresent(uint f);'
-if (-not [Ocarina.Cpu]::IsProcessorFeaturePresent(40)) { $script:avisos += (L 'Este processador não tem AVX2, então o jogo não deve funcionar.' 'This processor has no AVX2, so the game should not work.'); $script:bloqueio = $true }
+# PF_AVX2 (40) is answered from Windows 10 2004 on; older Windows says 0 for it and for SSSE3 (36), which every x64 CPU has
+if (-not [Ocarina.Cpu]::IsProcessorFeaturePresent(40)) {
+    if ([Ocarina.Cpu]::IsProcessorFeaturePresent(36)) { $script:avisos += (L 'Este processador não tem AVX2, então o jogo não deve funcionar.' 'This processor has no AVX2, so the game should not work.'); $script:bloqueio = $true }
+    else { $script:avisos += (L 'Esta versão do Windows não informa se o processador tem AVX2. O jogo precisa de AVX2.' 'This Windows version does not say whether the processor has AVX2. The game needs it.') }
+}
 if ($gpus -notmatch 'NVIDIA') { $script:avisos += (L "Só testamos em placa NVIDIA. Sua placa ($gpus) pode não funcionar." "We only tested on NVIDIA cards. Your card ($gpus) may not work.") }
 if (-not $SETUP -or -not (Test-Path -LiteralPath (Join-Path $SETUP 'ferramentas\python\python.exe'))) {
     $script:avisos += (L 'Extraia o ZIP inteiro para uma pasta e abra o instalador de dentro dela.' 'Unpack the whole ZIP to a folder and open the installer from inside it.')

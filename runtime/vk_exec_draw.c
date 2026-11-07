@@ -54,7 +54,7 @@ static const uint32_t (*c0_push)[NVN2_ROOT_WORDS];
     env_v_; })
 
 static uint8_t geometry_input;                              // normalized actual draw primitive; zero outside opt-in GS
-#define ONESHOT_WAIT_MS 1000u   /* LOCAL TEST (Ocarina): was 30000; a pipeline with guarded candidates compiles for a minute, and the game froze that long */ //   // prepare_draw: how long a one-shot draw waits for its pipeline before it is skipped
+#define ONESHOT_WAIT_MS 1000u   // Per one-shot draw, shared across the frame on AMD.
 
 static void c0_lay_set(VkExec *ex, const GfxShader *cs) {
     c0_lay = gfx_shader_c0_layout(cs);
@@ -1043,7 +1043,7 @@ static void c0_table(uint8_t *at, const p_bind_buf b[16]) {
 // see: it tests the addresses listed in c0 + 0x900, 16 bytes each (address, size). Collected per dispatch from the bound
 // uniform and storage buffers, following stored pointers two levels down. ponytail: only stored pointers near the start of
 // a buffer are followed and each binding stops at 32 MiB; a real fix would give shaders the guest address space.
-#define DYN_C0 0x900
+#define DYN_C0 NVN2_C0_LIST
 #define DYN_N 32
 _Static_assert(0x770 + 16 * 16 <= DYN_C0, "native mesh table overlaps candidates");
 _Static_assert(DYN_C0 + DYN_N * 16 <= VK_C0_BYTES, "candidate list exceeds bank");
@@ -2938,7 +2938,9 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         static int skip_w = -1, skip_h;   // OOT_SKIP_PASS=<w>x<h>: no draws in passes of that size
         if (skip_w < 0) { const char *e = getenv("OOT_SKIP_PASS"); skip_w = 0; if (e) sscanf(e, "%dx%d", &skip_w, &skip_h); }
         if (skip_w && (int)ex->pass_w == skip_w && (int)ex->pass_h == skip_h) return 0;
-        if (ex->pass_w == 256 && ex->pass_h == 144 && ENV_ONCE("OOT_COUNT_256")) {
+        static int count_small = -1;
+        if (count_small < 0) count_small = getenv("OOT_COUNT_256") != NULL;
+        if (ex->pass_w == 256 && ex->pass_h == 144 && count_small) {
             static int told;
             if (told++ < 200) rt_log("256-draw prog %llu count %d frame %llu", ex->prog ? (unsigned long long)ex->prog->serial : 0ull, (int)count, (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
         }
@@ -3017,16 +3019,32 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
             }
         }
     }
+    // Before the vertex slot is read: a shader still translating there can turn out to be a task shader (PR #29, qiyuey);
+    // built as a vertex stage it crashed NVIDIA's compiler (nvgpucomp64.dll) at the Deku Tree scene start.
+    // A draw into a target the previous frame did not render (or into none) waits for a pending shader or pipeline:
+    // one-shot draws (volumes and LUTs generated once, later only sampled) would leave their target empty for the
+    // session. A draw into per-frame targets is skipped until they are ready and comes back next frame.
+    int oneshot = -1, skip = pipe_skip_mode();   // -1: not looked up
+    if (vs_wait || fs_wait || gs_wait) {
+        if (!(oneshot = !vk_exec_targets_recent(ex, skip >= 1))) return perf_count(PERF_CNT_SHADER_SKIP), 0;   // skipped until ready
+        perf_count(PERF_CNT_ONESHOT_WAIT);
+        if (vs_wait) vs = shader_for(ex, NVN_STAGE_VS, &has_vs, NULL, 1);
+        if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
+        native_gs_vs = vs, native_gs_fs = fs;
+        if (gs_wait) gs = shader_for(ex, NVN_STAGE_GS, &has_gs, NULL, 1);
+    }
     const GfxShader *ts = NULL;
     if (vs && gfx_shader_is_task(vs)) {   // LOCAL TEST (Ocarina): task in the vertex slot, mesh in the tessellation slot
         int has_mesh = 0;
         ts = vs;
         vs = shader_for(ex, 4, &has_mesh, NULL, 1);
-        if (!vs) return draw_why(ex, "task without a mesh stage"), 0;
+        if (!vs || !gfx_shader_is_mesh(vs)) return draw_why(ex, "task without a mesh stage"), 0;
         mesh_task_draw = 1;
         B.c0_valid[0] = 0;
     }
-    if (ts && ENV_ONCE("OOT_NO_TASK")) return 0;   // LOCAL TEST (Ocarina)
+    static int no_task = -1;
+    if (no_task < 0) no_task = getenv("OOT_NO_TASK") != NULL;
+    if (ts && no_task) return 0;
     if (vs && gfx_shader_is_mesh(vs)) mesh_task_draw = 1;
     if (!has_vs) return warn_once(W_NO_VS, "a draw with a program that has no vertex stage is skipped"), 0;
     if (vs && gfx_shader_is_mesh(vs) != draw_is_mesh) return draw_why(ex, "mesh program in a vertex draw, or the reverse"), 0;
@@ -3055,18 +3073,6 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
             }
         }
     }
-    // A draw into a target the previous frame did not render (or into none) waits for a pending shader or pipeline:
-    // one-shot draws (volumes and LUTs generated once, later only sampled) would leave their target empty for the
-    // session. A draw into per-frame targets is skipped until they are ready and comes back next frame.
-    int oneshot = -1, skip = pipe_skip_mode();   // -1: not looked up
-    if (vs_wait || fs_wait || gs_wait) {
-        if (!(oneshot = !vk_exec_targets_recent(ex, skip >= 1))) return perf_count(PERF_CNT_SHADER_SKIP), 0;   // skipped until ready
-        perf_count(PERF_CNT_ONESHOT_WAIT);
-        if (vs_wait) vs = shader_for(ex, NVN_STAGE_VS, &has_vs, NULL, 1);
-        if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
-        native_gs_vs = vs, native_gs_fs = fs;
-        if (gs_wait) gs = shader_for(ex, NVN_STAGE_GS, &has_gs, NULL, 1);
-    }
     if (stage_diag_skip(ex, vs)) { if (draw_is_mesh) draw_why(ex, "stage diag skip"); return 0; }
     if (light_quad_fault_skip(ex, vs, fs)) return draw_why(ex, "light quad skip"), 0;
     if (!vs || (has_fs && !fs) || (want_gs && (!has_gs || !gs))) {
@@ -3077,33 +3083,37 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     uint32_t fbl = feedback_prepare(ex, fs);
     VkPipeState s = ex->pipe;
     { uint64_t f_ = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED); if (f_ >= 1798 && f_ <= 1799 && ex->pass_w == 2560) rt_log("vk: draw into 2560 frame %llu program %llu viewport %g %g %g %g scissor %d %d %u %u", (unsigned long long)f_, (unsigned long long)ex->prog->serial, ex->vp[0][0], ex->vp[0][1], ex->vp[0][2], ex->vp[0][3], sc.offset.x, sc.offset.y, sc.extent.width, sc.extent.height); }
-    {   // LOCAL TEST (Ocarina): the value the material shaders divide by, per frame (fragment slot 2 + 0x8c)
+    {   // Material diagnostics only inspect resources while their output can be used.
         static uint64_t last;
+        static int flash_log = -1;
+        if (flash_log < 0) flash_log = getenv("OOT_FLASH_LOG") != NULL;
         uint64_t f_ = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-        uint64_t a_ = ex->ssbo[NVN_STAGE_FS][2].addr;
-        VkMemInspect mi;
-        int mat_ = 0;
-        if (fs) {
-            const GfxShaderRes *r_;
-            int n_ = gfx_shader_resources(fs, GFX_RES_SSBO, &r_);
-            for (int i_ = 0; i_ < n_; i_++) mat_ |= r_[i_].cbuf_slot == 0 && r_[i_].handle * 4 == 0x530;
-        }
-        {   // per frame: the random rotation in fragment c6[38], for correlating with OOT_FLASH_LOG
-            static uint64_t lastf;
-            static char line[97];
-            static int nl_;
-            const p_bind_buf *u6 = &ex->ubo[NVN_STAGE_FS][3];
-            if (ENV_ONCE("OOT_FLASH_LOG") && mat_ && f_ != lastf && u6->addr && u6->size >= 0x270) {
-                lastf = f_;
-                const float *q = (const float *)(uintptr_t)(u6->addr + 38 * 16);
-                line[nl_++] = q[1] < 0 ? '-' : '+';
-                if (nl_ == 96) { line[96] = 0; rt_log("rot: frame %llu: %s", (unsigned long long)f_, line); nl_ = 0; }
+        if (flash_log || (f_ >= 1700 && f_ < 1801)) {
+            uint64_t a_ = ex->ssbo[NVN_STAGE_FS][2].addr;
+            VkMemInspect mi;
+            int mat_ = 0;
+            if (fs) {
+                const GfxShaderRes *r_;
+                int n_ = gfx_shader_resources(fs, GFX_RES_SSBO, &r_);
+                for (int i_ = 0; i_ < n_; i_++) mat_ |= r_[i_].cbuf_slot == 0 && r_[i_].handle * 4 == 0x530;
             }
-        }
-        if (mat_ && f_ >= 1700 && f_ < 1801 && f_ != last && ex->pass_w == 1280 && a_ && vk_mem_inspect(a_ + 0x8c, 4, &mi) && mi.pool_kind == VK_MEM_INSPECT_POOL_IMPORT) {
-            last = f_;
-            const float *v_ = (const float *)(uintptr_t)(a_ + 0x80);
-            rt_log("vk: f %llu slot2 %#llx +0x80: %g %g %g %g", (unsigned long long)f_, (unsigned long long)a_, v_[0], v_[1], v_[2], v_[3]);
+            {   // per frame: the random rotation in fragment c6[38], for correlating with OOT_FLASH_LOG
+                static uint64_t lastf;
+                static char line[97];
+                static int nl_;
+                const p_bind_buf *u6 = &ex->ubo[NVN_STAGE_FS][3];
+                if (flash_log && mat_ && f_ != lastf && u6->addr && u6->size >= 0x270) {
+                    lastf = f_;
+                    const float *q = (const float *)(uintptr_t)(u6->addr + 38 * 16);
+                    line[nl_++] = q[1] < 0 ? '-' : '+';
+                    if (nl_ == 96) { line[96] = 0; rt_log("rot: frame %llu: %s", (unsigned long long)f_, line); nl_ = 0; }
+                }
+            }
+            if (mat_ && f_ >= 1700 && f_ < 1801 && f_ != last && ex->pass_w == 1280 && a_ && vk_mem_inspect(a_ + 0x8c, 4, &mi) && mi.pool_kind == VK_MEM_INSPECT_POOL_IMPORT) {
+                last = f_;
+                const float *v_ = (const float *)(uintptr_t)(a_ + 0x80);
+                rt_log("vk: f %llu slot2 %#llx +0x80: %g %g %g %g", (unsigned long long)f_, (unsigned long long)a_, v_[0], v_[1], v_[2], v_[3]);
+            }
         }
     }
     s.vs = vs, s.fs = fs, s.gs = gs, s.ts = ts;
@@ -3116,20 +3126,26 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     int pending;
     // A draw of at most 6 vertices over half the render area or more (a full-screen triangle or quad, a tile) waits for
     // its pipeline: skipping it can leave a black tile. The waits share 50 ms per presented frame
-    // (TOTK_PIPE_SKIP=fullscreen skips them instead). A one-shot draw waits without that budget. Everything else is
+    // (TOTK_PIPE_SKIP=fullscreen skips them instead). On AMD one-shot draws share a separate budget. Everything else is
     // skipped while its pipeline is built.
-    static uint64_t wait_frame;
+    static uint64_t wait_frame = UINT64_MAX;
     static uint64_t wait_left_ns;
-    uint32_t wait_ms = 0;
-    uint64_t t0 = 0;
-    if (oneshot > 0) {
-        wait_ms = ONESHOT_WAIT_MS;
-    } else if (skip < 2 && count <= 6 && (uint64_t)sc.extent.width * sc.extent.height * 2 >= (uint64_t)ex->pass_w * ex->pass_h) {
-        uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-        if (f != wait_frame) wait_frame = f, wait_left_ns = 50000000;
-        wait_ms = (uint32_t)(wait_left_ns / 1000000);
-        if (wait_ms) t0 = kern_now_ns();
+    static uint64_t oneshot_left_ns;
+    uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    if (frame != wait_frame) {
+        wait_frame = frame;
+        wait_left_ns = 50000000;
+        oneshot_left_ns = ONESHOT_WAIT_MS * 1000000ull;
     }
+    uint64_t *budget_ns = NULL;
+    uint32_t wait_ms = 0;
+    if (oneshot > 0) {
+        if (vk_caps.amd) budget_ns = &oneshot_left_ns;
+        else wait_ms = ONESHOT_WAIT_MS;
+    } else if (skip < 2 && count <= 6 && (uint64_t)sc.extent.width * sc.extent.height * 2 >= (uint64_t)ex->pass_w * ex->pass_h) {
+        budget_ns = &wait_left_ns;
+    }
+    if (budget_ns) wait_ms = (uint32_t)(*budget_ns / 1000000);
     // The previous draw's pipeline while its state repeats (PM, TOTK_PIPE_MEMO=0 turns it off): the cache key is made
     // from the state alone, and a pipeline once found only changes from its fast link to its optimised build, read
     // from the info the cache entry keeps.
@@ -3140,18 +3156,24 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         info = PM.info, pending = 0;
         p = __atomic_load_n(&info->pipeline, __ATOMIC_ACQUIRE);
     } else {
-        w0 = t0 ? t0 : wait_ms ? kern_now_ns() : 0;   // the clock is read only for draws that may wait
+        w0 = wait_ms ? kern_now_ns() : 0;
         p = vk_pipeline_graphics_async(&s, &info, &pending, wait_ms);
-        if (t0) {
-            uint64_t spent = kern_now_ns() - t0;
-            wait_left_ns = spent < wait_left_ns ? wait_left_ns - spent : 0;
+        if (w0 && budget_ns) {
+            uint64_t spent = kern_now_ns() - w0;
+            *budget_ns = spent < *budget_ns ? *budget_ns - spent : 0;
         }
         why = oneshot > 0 ? "one-shot, shader" : wait_ms ? "full-screen" : NULL;
-        if (pending && oneshot < 0 && !vk_exec_targets_recent(ex, skip >= 1)) {
+        uint32_t oneshot_wait_ms = vk_caps.amd ? (uint32_t)(oneshot_left_ns / 1000000) : ONESHOT_WAIT_MS;
+        if (pending && oneshot < 0 && oneshot_wait_ms && !vk_exec_targets_recent(ex, skip >= 1)) {
             perf_count(PERF_CNT_ONESHOT_WAIT);
             why = "one-shot";
-            if (!w0) w0 = kern_now_ns();
-            p = vk_pipeline_graphics_async(&s, &info, &pending, ONESHOT_WAIT_MS);
+            uint64_t start = kern_now_ns();
+            if (!w0) w0 = start;
+            p = vk_pipeline_graphics_async(&s, &info, &pending, oneshot_wait_ms);
+            if (vk_caps.amd) {
+                uint64_t spent = kern_now_ns() - start;
+                oneshot_left_ns = spent < oneshot_left_ns ? oneshot_left_ns - spent : 0;
+            }
         }
         PM.valid = !pending && p && info;
         if (PM.valid) PM.s = s, PM.info = info;

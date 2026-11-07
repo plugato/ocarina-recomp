@@ -38,8 +38,8 @@
 # Which draws are dropped instead of waiting for their pipeline: strict (only draws into per-frame passes), any (also
 # draws into passes whose target the previous frame rendered) or fullscreen (those and full-screen draws).
 # pipe_skip = fullscreen
-# Build shader stage libraries in the background ahead of time, and the threads for it (1 to 16; default: a quarter of
-# the CPU threads).
+# Build shader stage libraries in the background ahead of time. Worker count (1 to 16): default 1 on NVIDIA,
+# otherwise a quarter of the CPU threads. More speculative workers can interfere with gameplay on NVIDIA.
 # lib_prebuild = 1
 # lib_prebuild_threads = 4
 # Build known pipelines ahead of time.
@@ -138,6 +138,9 @@
 # 3D render scale: the scene's size relative to the game resolution, game (5/6, the game's own 1600x900 at 1080p) or
 # a percentage (25 to 400, at most 4096 pixels a side); above 100 supersamples the scene (anti-aliasing). Read at start.
 # render_scale = game
+# Ocarina of Time: the 3D at a fixed percentage of the output, auto (the game's dynamic resolution, ~89 % at 1080p) or
+# 25 to 200 (above 100 untested). The dynamic one runs the first 30 frames. Changes take effect at once.
+# oot_resolution = 100
 # Scaling to the window when it is larger than the game resolution: fsr (AMD FSR 1) or bilinear, and FSR's sharpening
 # from 0 (off) to 100. Changes while the game runs take effect at once.
 # upscaler = fsr

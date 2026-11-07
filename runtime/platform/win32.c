@@ -15,6 +15,7 @@
 #include <string.h>
 #include <wchar.h>
 #include <wctype.h>
+#include <dbghelp.h>
 
 #include "platform.h"
 
@@ -680,8 +681,60 @@ static void invalid_parameter(const wchar_t *expr, const wchar_t *func, const wc
     crash_from_runtime("invalid parameter to a C runtime function", 0xc0000417u);   // STATUS_INVALID_CRUNTIME_PARAMETER
 }
 
+// LOCAL TEST (Ocarina): a crash outside this executable (a driver, the C runtime's heap) passed crash_veh by and the
+// process ended with no word in the log (issue #12). The last-chance filter names the module and offset, and with
+// OOT_MINIDUMP=<file.dmp> writes a minidump: threads and stacks only, for local debugging. A dump holds game memory, so
+// it is never to be shared publicly.
+static _Thread_local const char *crash_note;
+void plat_crash_note(const char *note) { crash_note = note; }
+static char crash_path[1024];
+void plat_crash_file(const char *path) { snprintf(crash_path, sizeof crash_path, "%s", path); }
+
+static LONG WINAPI last_chance(EXCEPTION_POINTERS *ep) {
+    uintptr_t rip = (uintptr_t)ep->ExceptionRecord->ExceptionAddress;
+    HMODULE m = NULL;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)rip, &m))
+        GetModuleFileNameA(m, name, sizeof name);
+    const char *base = strrchr(name, '\\') ? strrchr(name, '\\') + 1 : name;
+    fprintf(stderr, "[host] crash: unhandled exception 0x%08lx at %s+0x%llx, thread %lu", (unsigned long)ep->ExceptionRecord->ExceptionCode,
+            base, (unsigned long long)(rip - (uintptr_t)m), (unsigned long)GetCurrentThreadId());
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
+        fprintf(stderr, ", %s 0x%llx", ep->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
+                (unsigned long long)ep->ExceptionRecord->ExceptionInformation[1]);
+    PWSTR tn = NULL;
+    if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &tn)) && tn) {
+        fprintf(stderr, ", thread name \"%ls\"", tn);
+        LocalFree(tn);
+    }
+    fprintf(stderr, ", working on: %s", crash_note ? crash_note : "(nothing noted)");
+    fputc('\n', stderr);
+    FILE *cf = crash_note && crash_path[0] ? fopen(crash_path, "a") : NULL;   // the next start avoids this work (vk_pipeline.c)
+    if (cf) fprintf(cf, "%s\n", crash_note), fclose(cf);
+    // A driver that runs out of memory may crash on a null pointer instead of failing: the commit numbers tell
+    MEMORYSTATUSEX ms = {.dwLength = sizeof ms};
+    PROCESS_MEMORY_COUNTERS_EX pc = {.cb = sizeof pc};
+    if (GlobalMemoryStatusEx(&ms) && GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pc, sizeof pc))
+        fprintf(stderr, "[host] crash: memory: this process %llu MiB private; system RAM %llu of %llu MiB free, commit %llu of %llu MiB free\n",
+                (unsigned long long)(pc.PrivateUsage >> 20), (unsigned long long)(ms.ullAvailPhys >> 20), (unsigned long long)(ms.ullTotalPhys >> 20),
+                (unsigned long long)(ms.ullAvailPageFile >> 20), (unsigned long long)(ms.ullTotalPageFile >> 20));
+    fflush(stderr);
+    const char *dump = getenv("OOT_MINIDUMP");
+    HMODULE dh = dump ? LoadLibraryA("dbghelp.dll") : NULL;
+    typedef BOOL(WINAPI * WriteDump)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION, PVOID, PVOID);
+    WriteDump wd = dh ? (WriteDump)(void (*)(void))GetProcAddress(dh, "MiniDumpWriteDump") : NULL;
+    HANDLE f = wd ? CreateFileA(dump, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL) : INVALID_HANDLE_VALUE;
+    if (f != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION mei = {GetCurrentThreadId(), ep, FALSE};
+        wd(GetCurrentProcess(), GetCurrentProcessId(), f, (MINIDUMP_TYPE)(MiniDumpNormal | MiniDumpWithThreadInfo), &mei, NULL, NULL);
+        CloseHandle(f);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
     crash_fn = fn;
+    SetUnhandledExceptionFilter(last_chance);
     AddVectoredExceptionHandler(0, crash_veh);
     SetUnhandledExceptionFilter(crash_filter);   // replaces the C runtime's filter; crash_fn never returns
     signal(SIGABRT, abort_signal);

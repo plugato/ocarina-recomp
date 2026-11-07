@@ -715,6 +715,8 @@ def main():
     ap.add_argument('--modules', help='comma-separated subset of the layout modules (default all)')
     ap.add_argument('--jobs', type=int, help='parallel compiles (default: by memory budget and CPU count)')
     ap.add_argument('--compile-only', action='store_true', help='compile, do not link')
+    ap.add_argument('--pdb', action='store_true', help='Windows: CodeView line tables in every object and <out>/ocarina.pdb, for '
+                    'Windows profilers and debuggers (Visual Studio, Superluminal, VTune). The generated code compiles again')
     ap.add_argument('--runtime', type=Path, help='runtime source directory (default runtime)')
     ap.add_argument('--full-build', action='store_true',
                     help="compile the generated C even where build/<version>'s objects could be reused")
@@ -789,6 +791,11 @@ def main():
         GEN_FLAGS[:0] = sysroot
         RT_FLAGS[:0] = sysroot
         LINK_FLAGS[:0] = sysroot
+    if args.pdb and WIN:
+        # Line tables keep the objects small; the functions are named after their guest addresses in the PDB
+        RT_FLAGS.append('-gcodeview')
+        GEN_FLAGS[:0] = ['-gcodeview', '-gline-tables-only']
+        LINK_FLAGS.extend(['-Xlinker', '"--pdb=$builddir/ocarina.pdb"'])
     for tool in (CLANG, NINJA):
         if not tool.is_file():
             sys.exit(f'{tool} not found: install ' + ('MSYS2 UCRT64 clang, lld and ninja' if WIN else 'clang, lld and ninja')

@@ -45,6 +45,12 @@ typedef struct PoolRec {
     uint32_t flags;
     uint64_t lo, size;                 // GPU address range of the pool
     uint64_t import_lo, import_hi;     // POOL_IMPORT: the imported host range (aligned outwards)
+    // POOL_IMPORT larger than the device's maxBufferSize (import_pool): nwin buffers of wlen bytes over the one import,
+    // window w at byte w * wstep (wstep = wlen / 2), so a range of up to wstep bytes always lies inside one of them.
+    // wbuf[0] is also buf. nwin 0: one buffer, as before.
+    VkBuffer *wbuf;
+    uint32_t nwin;
+    uint64_t wstep, wlen;
     VkBuffer buf;
     VkDeviceMemory mem;                // POOL_IMPORT
     VmaAllocation alloc;               // POOL_PHYS
@@ -134,24 +140,43 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
         rt_log("vk: pool %#llx+%#llx: host pointer not importable (%d)", (unsigned long long)addr, (unsigned long long)size, (int)res);
         return 0;
     }
+    // A pool larger than maxBufferSize (AMD: 2 GiB; Ocarina has a 2.4 GiB one) cannot be one VkBuffer: past the limit
+    // the driver's behaviour is undefined, and AMD's has hung the GPU on it. The memory stays one import; buffers of
+    // wlen bytes start every wstep = wlen / 2 bytes over it (wstep a power of two, so every bind offset is aligned),
+    // and vk_mem_resolve hands out the window that holds the range. Smaller pools, every pool on NVIDIA, are unchanged.
+    uint64_t blen = n;
+    if (c->max_buffer_size && n > c->max_buffer_size) {
+        uint64_t step = 1;
+        while (step * 4 <= c->max_buffer_size) step *= 2;   // the largest power of two <= maxBufferSize / 2
+        r->wstep = step, r->wlen = step * 2;
+        r->nwin = (uint32_t)((n - r->wlen + step - 1) / step + 1);
+        r->wbuf = calloc(r->nwin, sizeof *r->wbuf);
+        if (!r->wbuf) { r->nwin = 0; rt_log("vk: pool %#llx: out of memory for its window buffers", (unsigned long long)addr); return 0; }
+        blen = r->wlen;
+        rt_log("vk: pool %#llx+%#llx is larger than maxBufferSize %#llx: %u window buffers of %#llx every %#llx",
+               (unsigned long long)addr, (unsigned long long)size, (unsigned long long)c->max_buffer_size, r->nwin,
+               (unsigned long long)r->wlen, (unsigned long long)r->wstep);
+    }
     VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
                                            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
-    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = n,
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = blen,
                              .usage = pool_usage(c), .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     if ((res = vkCreateBuffer(c->device, &bi, NULL, &r->buf)) != VK_SUCCESS) {
         rt_log("vk: pool %#llx: vkCreateBuffer for the import failed (%d)", (unsigned long long)addr, (int)res);
+        free(r->wbuf), r->wbuf = NULL, r->nwin = 0;
         return 0;
     }
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(c->device, r->buf, &req);
     int type = memory_type(c, req.memoryTypeBits & hp.memoryTypeBits,
                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (type < 0 || req.size > n) {
+    if (type < 0 || req.size > blen) {
         rt_log("vk: pool %#llx: no memory type for the import (buffer %#x, host %#x, size %#llx of %#llx)",
                (unsigned long long)addr, req.memoryTypeBits, hp.memoryTypeBits, (unsigned long long)req.size,
-               (unsigned long long)n);
+               (unsigned long long)blen);
         vkDestroyBuffer(c->device, r->buf, NULL);
         r->buf = VK_NULL_HANDLE;
+        free(r->wbuf), r->wbuf = NULL, r->nwin = 0;
         return 0;
     }
     VkImportMemoryHostPointerInfoEXT im = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
@@ -166,10 +191,38 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
         vkDestroyBuffer(c->device, r->buf, NULL);
         r->buf = VK_NULL_HANDLE;
         r->mem = VK_NULL_HANDLE;
+        free(r->wbuf), r->wbuf = NULL, r->nwin = 0;
         return 0;
+    }
+    if (r->nwin) {
+        r->wbuf[0] = r->buf;
+        for (uint32_t w = 1; w < r->nwin; w++) {
+            uint64_t at = w * r->wstep, len = n - at < r->wlen ? n - at : r->wlen;
+            VkBufferCreateInfo wi = bi;
+            wi.size = len;
+            if ((res = vkCreateBuffer(c->device, &wi, NULL, &r->wbuf[w])) != VK_SUCCESS ||
+                (res = vkBindBufferMemory(c->device, r->wbuf[w], r->mem, at)) != VK_SUCCESS) {
+                rt_log("vk: pool %#llx: window buffer %u failed (%d)", (unsigned long long)addr, w, (int)res);
+                for (uint32_t k = 0; k <= w; k++) if (r->wbuf[k]) vkDestroyBuffer(c->device, r->wbuf[k], NULL);
+                vkFreeMemory(c->device, r->mem, NULL);
+                r->buf = VK_NULL_HANDLE, r->mem = VK_NULL_HANDLE;
+                free(r->wbuf), r->wbuf = NULL, r->nwin = 0;
+                return 0;
+            }
+        }
     }
     plat_inc32(&n_imports);
     return 1;
+}
+
+// The window of a windowed import (nwin > 0) for the range at byte off of the import: the one starting at or below off
+// with the most room after it, so any range of up to wstep bytes fits. *start and *end are its bytes in the import.
+static uint32_t import_window(const PoolRec *r, uint64_t off, uint64_t *start, uint64_t *end) {
+    uint64_t n = r->import_hi - r->import_lo, w = off / r->wstep;
+    if (w >= r->nwin) w = r->nwin - 1;
+    *start = w * r->wstep;
+    *end = n - *start < r->wlen ? n : *start + r->wlen;
+    return (uint32_t)w;
 }
 
 // Physical pool: device-local memory of the pool size that both buffers and optimal-tiling images can be bound to.
@@ -240,6 +293,11 @@ static PoolRec *phys_find(const pool_t *key) {
 static void destroy_rec(VkCtx *c, PoolRec *r) {
     if (r->mbuf) vmaDestroyBuffer(c->vma, r->mbuf, r->malloc_);
     if (r->salloc) vmaDestroyBuffer(c->vma, r->buf, r->salloc), r->buf = VK_NULL_HANDLE;
+    if (r->nwin) {   // wbuf[0] is buf
+        for (uint32_t w = 0; w < r->nwin; w++) if (r->wbuf[w]) vkDestroyBuffer(c->device, r->wbuf[w], NULL);
+        r->buf = VK_NULL_HANDLE;
+    }
+    free(r->wbuf);
     if (r->buf) vkDestroyBuffer(c->device, r->buf, NULL);
     if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
     if (r->alloc) vmaFreeMemory(c->vma, r->alloc);
@@ -541,6 +599,17 @@ static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out) {
             h->lo = e->lo, h->hi = e->hi, h->buf = r->buf, h->cls = rec_class(r);
             if (r->kind == POOL_IMPORT) h->base = r->import_lo, h->end = r->import_hi, h->alloc = NULL, h->pool = r;
             else h->base = r->lo, h->end = r->lo + r->size, h->alloc = r->alloc, h->pool = NULL;
+            if (r->kind == POOL_IMPORT && r->nwin) {
+                // A windowed pool caches the window of this address, for the ranges the locked lookup would give the
+                // same window: those starting below the next window's start (all of the rest for the last window).
+                uint64_t ws, we;
+                uint32_t w = import_window(r, addr - r->import_lo, &ws, &we);
+                h->buf = r->wbuf[w];
+                h->base = r->import_lo + ws, h->end = r->import_lo + we;
+                uint64_t lo = h->base, hi = w + 1 < r->nwin ? h->base + r->wstep : h->end;
+                if (lo > h->lo) h->lo = lo;
+                if (hi < h->hi) h->hi = hi;
+            }
         }
     }
     if (r && r->kind == POOL_IMPORT && r->buf) {
@@ -549,8 +618,21 @@ static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out) {
         out->buffer = r->buf;
         out->offset = addr - r->import_lo;
         out->avail = r->import_hi - addr;
+        if (r->nwin) {
+            uint64_t ws, we;
+            uint32_t w = import_window(r, out->offset, &ws, &we);
+            out->buffer = r->wbuf[w];
+            out->offset -= ws;
+            out->avail = r->import_lo + we - addr;
+        }
         if (r->smap && !r->stouched) shadow_touch(r);
-        ok = 1;
+        // A range that crosses its window's end is not contiguous in any one buffer: like a virtual pool range that
+        // runs into another page, it does not resolve, and callers that resolve one byte clamp to avail themselves.
+        ok = out->avail >= size;
+        static volatile int32_t crossed;
+        if (!ok && plat_inc32(&crossed) == 1)
+            rt_log("vk: a range of %#llx bytes at %#llx crosses a window end of an import past maxBufferSize (logged once)",
+                   (unsigned long long)size, (unsigned long long)addr);
     } else if (r && r->kind == POOL_PHYS) {
         out->buffer = r->buf;
         out->offset = out->alloc_offset = addr - r->lo;
@@ -1431,6 +1513,9 @@ static void mirror_create(PoolRec *r) {
     r->mstate = MS_REFUSED;
     __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
     if (r->kind != POOL_IMPORT || !r->buf || !n) return;
+    // A mirror past maxBufferSize would be an oversized buffer (VUID-VkBufferCreateInfo-size-06409), and a windowed
+    // import's spans name window buffers, not offsets into one mirror. Such a pool stays imported.
+    if (c->max_buffer_size && n > c->max_buffer_size) return refuse(r, MR_ALLOC, "it is larger than the device's maxBufferSize");
     plat_mutex_lock_shared(&pool_lock);
     int i = pidx_upper(&pool_index, r->lo) - 1;
     while (i >= 0 && pool_index.e[i].buf != r) i--;
@@ -1447,6 +1532,29 @@ static void mirror_create(PoolRec *r) {
         char why[128];
         snprintf(why, sizeof why, "its %.1f MiB mirror does not fit the VRAM budget (%.0f of %.0f MiB in use)",
                  n / 1048576.0, used / 1048576.0, budget / 1048576.0);
+        return refuse(r, MR_BUDGET, why);
+    }
+    // Cards of 8 GiB or less give at most an eighth of the device-local heap to mirrors (after NotRexed/Hookshot
+    // c02f290d4): on an RTX 4060 Ti 8 GB mirrors reached 2.8 GiB, the textures spilled to system memory, 2-12 fps
+    // (issue #18). Cards of 12 GiB or less get at most 1 GiB: an RTX 5070 12 GB reached 2.96 GiB of mirrors in Kokiri
+    // village and fell to 9-11 fps, and held 30 fps with 1 GiB (Ocarina issue #88). A mirror is a speed-up; the pool
+    // works imported. TOTK_MIRROR_MAX_MB overrides (0 = no cap).
+    static int64_t mirror_cap = -1;   // replay thread only
+    if (mirror_cap < 0) {
+        const char *s = cfg_get("TOTK_MIRROR_MAX_MB");
+        uint64_t heap = 0;
+        for (uint32_t h = 0; h < c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
+            if (c->mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT && c->mem_props.memoryHeaps[h].size > heap)
+                heap = c->mem_props.memoryHeaps[h].size;
+        mirror_cap = s && *s ? (int64_t)atoll(s) << 20 : heap && heap <= (12ull << 30) ? (int64_t)(heap / 8 < (1ull << 30) ? heap / 8 : 1ull << 30) : 0;
+        if (mirror_cap < 0) mirror_cap = 0;
+        rt_log("mem: mirrors capped at %.0f MiB (0 = no cap; device-local heap %.0f MiB)", mirror_cap / 1048576.0,
+               heap / 1048576.0);
+    }
+    if (mirror_cap && m_live_bytes + (int64_t)n > mirror_cap) {
+        char why[128];
+        snprintf(why, sizeof why, "its %.1f MiB mirror passes the mirror cap (%.0f of %.0f MiB mirrored)", n / 1048576.0,
+                 m_live_bytes / 1048576.0, mirror_cap / 1048576.0);
         return refuse(r, MR_BUDGET, why);
     }
     plat_mutex_lock(&gen_lock);

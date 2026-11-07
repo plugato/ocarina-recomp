@@ -1065,17 +1065,21 @@ static Tex *entry_of(const tex_t *t) {
             tex_alias = cfg_bool("TOTK_TEX_ALIAS");
             rt_log("vk: texture aliases: %s", tex_alias ? "a new image takes the live image's content" : "a new image starts empty");
         }
+        // Retire obsolete descriptors before allocating their replacements.
+        // Otherwise a failed allocation leaves the old images resident and
+        // every retry of a resized render target starts under the same pressure.
+        for (Tex *p = nvn_hm_get(&by_addr, &k.addr), *next; p; p = next) {
+            next = p->next_at;
+            if (p->released) destroy_tex(p);
+        }
         if (!(e = create_tex(t, &k, tex_alias))) return NULL;
         perf_count(PERF_CNT_TEX_NEW);
         dropped_check(&k);
         e->use_seq = ++use_counter;
-        // released entries of another descriptor at this address are replaced by the new one; a live one holding
-        // GPU-written content is the alias source, preferring the one that differs only in swizzle (same_but_swizzle)
+        // Prefer a live alias that differs only in swizzle as the copy source.
         int alias = 0;
         Tex *src = NULL;
-        for (Tex *p = nvn_hm_get(&by_addr, &k.addr), *nx; p; p = nx) {
-            nx = p->next_at;
-            if (p->released) { destroy_tex(p); continue; }
+        for (Tex *p = nvn_hm_get(&by_addr, &k.addr); p; p = p->next_at) {
             alias = 1;
             if (tex_alias && (!src || (same_but_swizzle(&p->key, &k) && !same_but_swizzle(&src->key, &k))) &&
                 alias_compatible(e, p) && alias_has_gpu_content(p))

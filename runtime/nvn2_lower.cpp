@@ -2,6 +2,7 @@
 // lowering (runtime/third_party/eglantine, GPL-3.0-or-later) rewrites the Ampere code as Maxwell, laid out as TotK's
 // translator reads it, and a synthetic control block carries the fields the host reads.
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -56,7 +57,11 @@ Lowered *lower(const uint8_t *control, const uint8_t *code) {
     const uint32_t sph_type = gfx ? (w0 >> 10) & 15 : 0;
     Shader::Ampere::LoweringOptions lower_options;
     lower_options.geometry = sph_type == 4;
-    lower_options.tensor = false;   // true emits a pseudo instruction only Lichii's backend knows (green lines over movies here)
+    // LOCAL TEST (Ocarina): each HMMA becomes one pseudo instruction (0x5d31/0x5d33) that the translator (patch 0036)
+    // turns into a call to a shared helper, instead of ~300 inline Maxwell instructions (the NDSR TAAU had 1.39 M SPIR-V
+    // words). OOT_HMMA_COMPACT=0 brings back the inline expansion.
+    static const bool compact_hmma = [] { const char *e = std::getenv("OOT_HMMA_COMPACT"); return !(e && *e == '0'); }();
+    lower_options.tensor = compact_hmma;
     lower_options.native_code_address = reinterpret_cast<uint64_t>(code) + hdr;
     // LOCAL TEST (Ocarina): a stage in a tessellation slot that writes the stage buffer is a mesh program after a task.
     bool writes_stage_buffer = false;

@@ -10,7 +10,7 @@ The folder holds, with nothing derived from the game (tools/check_content.py run
     Instalar-Ocarina.exe   instalador/launcher.c, which opens the script below
     instalador/            Instalar-Ocarina.ps1, the installer
     projeto/               this repository at HEAD (git archive), without the translator's sources and the tests
-    ferramentas/python/    python.org embeddable 3.14, numpy and lz4 (recomp/gen.py)
+    ferramentas/python/    python.org embeddable 3.14, numpy and lz4 (recomp/gen.py), zstandard (tools/oot/shader_extract.py)
     ferramentas/llvm/      llvm-mingw, x86_64 only: what clang and lld need to compile and link the game
     ferramentas/deps/      headers, libraries and DLLs of Vulkan, VMA, SDL3, Opus, libvpx, dav1d and zstd
     ferramentas/bin/       ninja.exe, unzbic.exe (kinnay/zbic, GPL-2.0), totk_xlate.exe and totk_xlate.id
@@ -128,7 +128,7 @@ def build_python(tools):
     # the embeddable Python ignores the script's folder once a ._pth exists: ferramentas\python, so the project is two levels up
     (py / 'python314._pth').write_text('python314.zip\n.\nLib/site-packages\n../../tools\n../../recomp\n', encoding='utf-8')
     run([sys.executable, '-m', 'pip', 'install', '-q', '--disable-pip-version-check', '--target', py / 'Lib' / 'site-packages', '--python-version', '3.14',
-         '--implementation', 'cp', '--abi', 'cp314', '--platform', 'win_amd64', '--only-binary', ':all:', 'numpy==2.5.4', 'lz4==4.4.5'])
+         '--implementation', 'cp', '--abi', 'cp314', '--platform', 'win_amd64', '--only-binary', ':all:', 'numpy==2.5.4', 'lz4==4.4.5', 'zstandard==0.25.0'])
     shutil.rmtree(py / 'Lib' / 'site-packages' / 'bin', ignore_errors=True)
     # numpy's tests and pip's compiled files are not used, and their long paths can break unpacking the ZIP in a long folder
     for d in list((py / 'Lib' / 'site-packages').rglob('tests')) + list((py / 'Lib' / 'site-packages').rglob('__pycache__')):
@@ -208,6 +208,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--out', type=Path, default=ROOT / 'build' / 'setup')
     ap.add_argument('--no-zip', action='store_true')
+    ap.add_argument('--seed', type=Path, help='folder with seed-answers.bin and pipeline-keys.bin recorded in play: the shader '
+                    'preparation seed, copied into projeto/tools/data/oot-seed (out of the repository, as the TotK shader list)')
     args = ap.parse_args()
     version = (ROOT / 'VERSION').read_text().strip()
     folder = args.out / f'Ocarina-Setup-{version}'
@@ -220,6 +222,14 @@ def main():
     build_deps(tools)
     build_bin(tools, msys / 'clang.exe')
     build_project(folder)
+    if args.seed:
+        # Our recorded answers and pipeline keys: shader hashes, input ids and draw state, no game code. The installer's
+        # P-Shaders step prepares the player's own shaders from them.
+        seed = folder / 'projeto' / 'tools' / 'data' / 'oot-seed'
+        seed.mkdir(parents=True)
+        for f in ('seed-answers.bin', 'pipeline-keys.bin'):
+            shutil.copy2(args.seed / f, seed / f)
+        print('shader seed:', ', '.join(f'{p.name} {p.stat().st_size // 1024} KiB' for p in seed.iterdir()))
     env = dict(os.environ, PATH=f'{msys};{os.environ["PATH"]}')
     run(['sh', ROOT / 'instalador' / 'build_exe.sh'], env=env)
     shutil.copy2(ROOT / 'instalador' / 'Instalar-Ocarina.exe', folder / 'Instalar-Ocarina.exe')

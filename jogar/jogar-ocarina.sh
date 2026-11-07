@@ -32,5 +32,15 @@ cd "$root/build/oot111"
 if [ -t 1 ]; then
     exec ./ocarina "$@"
 else
+    # The previous run's logs go to logs/ (the newest 10 runs), as in jogar-ocarina.ps1.
+    if [ -s "$root/ultima-partida-erros.log" ]; then
+        mkdir -p "$root/logs"
+        when="$(date -r "$root/ultima-partida-erros.log" +%Y-%m-%d_%H-%M-%S)"
+        mv -f "$root/ultima-partida-erros.log" "$root/logs/partida-$when-erros.log"
+        [ -f "$root/ultima-partida.log" ] && mv -f "$root/ultima-partida.log" "$root/logs/partida-$when.log"
+        ls -1 "$root/logs"/partida-*-erros.log | sort -r | tail -n +11 | while read -r old; do
+            rm -f "$old" "${old%-erros.log}.log"
+        done
+    fi
     exec ./ocarina "$@" >"$root/ultima-partida.log" 2>"$root/ultima-partida-erros.log"
 fi

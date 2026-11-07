@@ -100,7 +100,14 @@ else
     printf '  [falta] zstd  (install zstd)\n'
     faltam=$((faltam + 1))
 fi
-[ -f /usr/include/vulkan/vulkan.h ] || pkg vulkan 'install vulkan-headers'
+# The loader's vulkan.pc is not the header: on Arch and CachyOS they are separate packages (issue #41)
+vk_inc=$(pkg-config --variable=includedir vulkan 2>/dev/null)
+if [ -f /usr/include/vulkan/vulkan.h ] || { [ -n "$vk_inc" ] && [ -f "$vk_inc/vulkan/vulkan.h" ]; }; then
+    printf '  [ok]    vulkan (header)\n'
+else
+    printf '  [falta] vulkan/vulkan.h  (install vulkan-headers)\n'
+    faltam=$((faltam + 1))
+fi
 if [ "$faltam" -gt 0 ]; then
     echo
     echo "$(L "Faltam $faltam item(ns). Instale o que está acima e rode de novo." "$faltam item(s) missing. Install what is above and run this again.")" >&2

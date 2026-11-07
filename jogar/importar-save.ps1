@@ -44,7 +44,27 @@ try {
     if (-not (EhSave $Origem)) { throw (L "Essa pasta não tem um save do jogo (account.sav): $Origem" "This folder has no save of the game (account.sav): $Origem") }
 
     if (-not $SemPerguntar) {
-        $r = [Windows.Forms.MessageBox]::Show((L "Importar este save?`n`n$Origem`n`nO seu save atual fica guardado em uma cópia. Feche o jogo antes de continuar." "Import this save?`n`n$Origem`n`nYour current save is kept in a copy. Close the game before continuing."), $NOME, 'YesNo', 'Question')
+        # A player imported an old emulator save over newer progress by mistake: when the current save is newer, say so and
+        # make No the default button. The current save is kept in a copy either way.
+        $aviso = ''
+        $uidAtual = Join-Path $Perfil 'account.uid'
+        if (Test-Path -LiteralPath $uidAtual) {
+            $u = [IO.File]::ReadAllBytes($uidAtual)
+            if ($u.Length -eq 16) {
+                [Array]::Reverse($u)
+                $atual = Join-Path $Perfil ("save\" + (-join ($u | ForEach-Object { $_.ToString('x2') })))
+                $quando = { param($d) (Get-ChildItem -LiteralPath $d -Recurse -File -ErrorAction SilentlyContinue | Measure-Object LastWriteTime -Maximum).Maximum }
+                if (Test-Path -LiteralPath $atual) {
+                    $tAtual = & $quando $atual; $tOrigem = & $quando $Origem
+                    if ($tAtual -and $tOrigem -and $tAtual -gt $tOrigem) {
+                        $aviso = (L "ATENÇÃO: o seu save atual ($($tAtual.ToString('g'))) é MAIS NOVO que o que vai ser importado ($($tOrigem.ToString('g'))). Importar troca o seu progresso pelo mais antigo.`n`n" "WARNING: your current save ($($tAtual.ToString('g'))) is NEWER than the one being imported ($($tOrigem.ToString('g'))). Importing replaces your progress with the older one.`n`n")
+                    }
+                }
+            }
+        }
+        $icone = if ($aviso) { 'Warning' } else { 'Question' }
+        $padrao = if ($aviso) { 'Button2' } else { 'Button1' }
+        $r = [Windows.Forms.MessageBox]::Show($aviso + (L "Importar este save?`n`n$Origem`n`nO seu save atual fica guardado em uma cópia em $Perfil\save-antes-de-importar-<data>. Feche o jogo antes de continuar." "Import this save?`n`n$Origem`n`nYour current save is kept in a copy in $Perfil\save-antes-de-importar-<date>. Close the game before continuing."), $NOME, 'YesNo', $icone, $padrao)
         if ($r -ne 'Yes') { exit 0 }
     }
     if (Get-Process ocarina -ErrorAction SilentlyContinue) { throw (L 'Feche o jogo e tente de novo.' 'Close the game and try again.') }

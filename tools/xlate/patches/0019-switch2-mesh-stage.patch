@@ -14,7 +14,7 @@
              context.SetMemoryModel(AddressingModel.Logical, MemoryModel.GLSL450);
  
              context.AddCapability(Capability.GroupNonUniformBallot);
-@@ -158,6 +165,209 @@
+@@ -158,6 +165,212 @@
              return result;
          }
  
@@ -79,6 +79,9 @@
 +
 +            SpvInstruction position = Output(vec4, maxVertices);
 +            c.Decorate(position, Decoration.BuiltIn, (SpvLiteralInteger)(int)BuiltIn.Position);
++            // Invariant, as patch 0007 makes a vertex shader's: the game draws foliage twice with two mesh shaders, a depth
++            // pre-pass and a colour pass that keeps depth EQUAL; positions computed differently flash white (nxnative e5f1adee6).
++            c.Decorate(position, Decoration.Invariant);
 +            SpvInstruction indices = Output(uvec3, maxPrimitives);
 +            c.Decorate(indices, Decoration.BuiltIn, (SpvLiteralInteger)5296);   // PrimitiveTriangleIndicesEXT
 +
@@ -224,7 +227,7 @@
          private static void Generate(CodeGenContext context, StructuredProgramInfo info, int funcIndex)
          {
              (StructuredFunction function, SpvInstruction spvFunc) = context.GetFunction(funcIndex);
-@@ -185,6 +336,12 @@
+@@ -185,6 +339,12 @@
  
              if (funcIndex == 0)
              {

@@ -34,9 +34,46 @@ static void oot_dyn_dt(Cpu *c) {
 
 '''
 
+FIXED_RES = r'''/* Fixed 3D resolution (OOT_RESOLUTION in the ini, TOTK_OOT_RESOLUTION in the environment, live): the scene at a set fraction of the output instead of the game's dynamic
+   resolution (~1706x960 for 1920x1080). The flag at +0x94 (main+0x805bd0, the site of Lichii's "Max Resolution" patch)
+   picks the GPU-time controller; the other path (L_700080640c) returns a fixed scale, 1.0 as shipped. The dynamic path
+   runs 30 frames first: it also writes fields the rest of the frame reads (+8, +16, +168), and the fixed path taken
+   from the first frame left them unset and the 3D black. After NotRexed/Hookshot c02f290d47ff (nx2/oot_patches.py,
+   host/nn_vi.c, GPL-3.0). "auto": the game's own; a percentage 25..200 (above 100 untested). */
+extern const char *cfg_get(const char *);
+extern unsigned cfg_version(void);
+extern void rt_log(const char *, ...);
+extern double strtod(const char *, char **);
+static int oot_dynres_runs;
+static uint32_t oot_res_bits = 0x3f800000u;
+static int oot_fixed_res(void) {
+    static unsigned seen = ~0u;
+    static int fixed;
+    unsigned v = cfg_version();
+    if (v != seen) {
+        seen = v;
+        // cfg_get, not cfg_value: a runtime built before the setting existed has no table row, and cfg_value made that fatal
+        const char *s = cfg_get("TOTK_OOT_RESOLUTION");
+        if (!s || !*s) s = "auto";
+        char *end;
+        double pct = strtod(s, &end);
+        fixed = end != s && !*end && pct >= 25 && pct <= 200;
+        if (fixed) { union { float f; uint32_t u; } k = {(float)(pct / 100)}; oot_res_bits = k.u; }
+        rt_log("resolution: 3D %s%s", fixed ? s : "the game's dynamic resolution", fixed ? " % of the output" : "");
+    }
+    return fixed && oot_dynres_runs >= 30;
+}
+
+'''
+
 EDITS = [
     ('main_0087.c', 'void f_70006e6be0(Cpu *c) {\n', DYN_DT + 'void f_70006e6be0(Cpu *c) {\n'),
     ('main_0087.c', '    fp_op_s(c, FOP_DIV, 8, 1, 0);\n', '    fp_op_s(c, FOP_DIV, 8, 1, 0); oot_dyn_dt(c);   /* real time step, main+0x6e6dc4 */\n'),
+    ('main_0098.c', 'void f_7000805aa0(Cpu *c) {\n', FIXED_RES + 'void f_7000805aa0(Cpu *c) {\n'),
+    ('main_0098.c', '    if (((x8 >> 0) & 1) == 0) { goto L_700080640c; }\n',
+     '    if (oot_fixed_res() || ((x8 >> 0) & 1) == 0) { goto L_700080640c; }\n    oot_dynres_runs++;\n'),
+    ('main_0098.c', '    x9 = (uint32_t)(0x3f800000ull);\n    goto L_7000806000;\n',
+     '    x9 = oot_fixed_res() ? oot_res_bits : 0x3f800000u;   /* the fixed path\'s scale */\n    goto L_7000806000;\n'),
     ('main_0133.c', 'L_7000c93940:;\n', 'L_7000c93940:;\n    if (x19 == 0) { goto L_7000c93a18; }   /* an unloaded resource takes the not-found path; was a read of 0x150 */\n'),
 ]
 

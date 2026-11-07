@@ -125,6 +125,7 @@ typedef struct Pipe {
     VkPipeInfo info;
     VkPipeBinding *bindings;
     int building;                      // a background job owns info.pipeline (under P.lock)
+    double one_shot_deadline_ms;       // bound the wait across retries while that job is still building
     struct Job *job;                   // that job while building
     const struct Layout *lay;          // graphics: the layout it was entered with
     VkPipeline fast;                   // GPL: the fast-linked pipeline (kept until shutdown: recorded draws use it)
@@ -149,6 +150,81 @@ static uint64_t key_hash(const void *k, size_t n) { return nvn_hm_hash(k, (uint3
 
 // The cache file lives next to totk.exe, so every build dir (the main build and each private fork) has its own:
 // forks that shared build\v121's cache broke each other's runs (2026-10-22).
+static PlatMutex cache_access = PLAT_MUTEX_INIT;
+// When both locks are needed, take cache_access before deferred_access.
+static PlatMutex deferred_access = PLAT_MUTEX_INIT;
+static VkPipelineCache deferred_cache;
+static uint32_t deferred_count;
+static uint64_t cache_updates;   // private cache results can arrive after the pipeline was counted
+
+static VkPipelineCache cache_private(void) {
+    VkPipelineCache own = VK_NULL_HANDLE;
+    if (!P.cache) return own;
+    VkPipelineCacheCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    if (vkCreatePipelineCache(P.device, &ci, NULL, &own) != VK_SUCCESS) return VK_NULL_HANDLE;
+    // Seed the private build from the cache loaded at startup, including
+    // compute pipelines saved by a previous process.
+    plat_mutex_lock_shared(&cache_access);
+    if (P.cache) vkMergePipelineCaches(P.device, own, 1, &P.cache);
+    plat_mutex_unlock_shared(&cache_access);
+    return own;
+}
+
+static void cache_retry_deferred(void) {
+    if (!plat_mutex_trylock(&cache_access)) return;
+    if (!plat_mutex_trylock(&deferred_access)) {
+        plat_mutex_unlock(&cache_access);
+        return;
+    }
+    if (deferred_cache && P.cache && vkMergePipelineCaches(P.device, P.cache, 1, &deferred_cache) == VK_SUCCESS) {
+        vkDestroyPipelineCache(P.device, deferred_cache, NULL);
+        deferred_cache = VK_NULL_HANDLE;
+        rt_log("vk_pipeline: merged %u deferred pipeline caches", deferred_count);
+        deferred_count = 0;
+        __atomic_add_fetch(&cache_updates, 1, __ATOMIC_RELAXED);
+    }
+    plat_mutex_unlock(&deferred_access);
+    plat_mutex_unlock(&cache_access);
+}
+
+// Takes ownership of a private cache once its pipeline has finished building.
+static void cache_publish(VkPipelineCache source) {
+    // A queued writer can block replay behind a slow driver compile. Keep the
+    // compiled pipeline even if the cache stays busy (VUID 10202).
+    const uint64_t deadline = plat_now_ns() + 50000000;
+    do {
+        if (plat_mutex_trylock(&cache_access)) {
+            VkResult r = P.cache ? vkMergePipelineCaches(P.device, P.cache, 1, &source) : VK_ERROR_INITIALIZATION_FAILED;
+            plat_mutex_unlock(&cache_access);
+            if (r == VK_SUCCESS) {
+                vkDestroyPipelineCache(P.device, source, NULL);
+                __atomic_add_fetch(&cache_updates, 1, __ATOMIC_RELAXED);
+                return;
+            }
+            rt_log("vk_pipeline: shared cache merge failed (%d), retaining private cache", (int)r);
+            break;
+        }
+        plat_sleep_ms(5);
+    } while (plat_now_ns() < deadline);
+
+    plat_mutex_lock(&deferred_access);
+    // Aggregate delayed results in one cache instead of retaining a seeded
+    // copy of the shared cache for every pipeline that finishes.
+    if (!deferred_cache) {
+        deferred_cache = source;
+        source = VK_NULL_HANDLE;
+    } else if (vkMergePipelineCaches(P.device, deferred_cache, 1, &source) != VK_SUCCESS) {
+        rt_log("vk_pipeline: could not retain a private pipeline cache");
+        vkDestroyPipelineCache(P.device, source, NULL);
+        plat_mutex_unlock(&deferred_access);
+        return;
+    }
+    rt_log("vk_pipeline: private cache merge deferred (%u pending)", ++deferred_count);
+    __atomic_add_fetch(&cache_updates, 1, __ATOMIC_RELAXED);
+    plat_mutex_unlock(&deferred_access);
+    if (source) vkDestroyPipelineCache(P.device, source, NULL);
+}
+
 static void cache_path_init(void) {
     const char *cfg_path = cfg_get("TOTK_PIPELINE_CACHE");
     if (cfg_path && *cfg_path && strlen(cfg_path) < sizeof P.cache_path) {
@@ -1979,6 +2055,7 @@ static int uses_src1(const VkPipeState *s) {
 static uint32_t target_wmask(const VkPipeState *s, int i) {
     uint32_t m = s->chmask.mask >> (4 * i) & 0xf;
     if (s->fs && !(gfx_shader_outputs(s->fs, NULL) >> i & 1)) m = 0;
+    if (s->fs) m &= gfx_shader_output_comps(s->fs, i);   // the channels it does not write stay, as on Maxwell
     if (i == 1 && s->fs && P.f_dual_src && uses_src1(s)) m = 0;   // output 1 is the second blend source (spirv_dual_source)
     return m;
 }
@@ -2054,7 +2131,47 @@ static uint32_t vs_union_missing(const VkPipeState *s, GfxShaderIo fin[32]) {
     return missing;
 }
 
-static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t fs_off) {
+// pipeline-crash.txt next to pipeline-keys.bin: the crash note of each graphics pipeline the driver crashed in
+// (platform last-chance filter), a line per crash. An RX 6750 XT crashed in amdvlk64.dll building a mesh pipeline
+// early in play. Crashed once: built without optimization. Twice: not built, its draws are skipped. Deleting the file
+// tries them all again.
+static char *crashed;   // the file's text; written once at init (keys_open), read by the build threads
+static void crashed_open(const char *keys_path) {
+    static char path[1024];
+    snprintf(path, sizeof path, "%s", keys_path);
+    char *slash = strrchr(path, '\\'), *fslash = strrchr(path, '/');
+    if (fslash > slash) slash = fslash;
+    snprintf(slash ? slash + 1 : path, sizeof path - (size_t)(slash ? slash + 1 - path : 0), "pipeline-crash.txt");
+    plat_crash_file(path);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    char *t = calloc(1, 1 << 16);
+    size_t n = t ? fread(t, 1, (1 << 16) - 1, f) : 0;
+    fclose(f);
+    if (!n) {
+        free(t);
+        return;
+    }
+    crashed = t;
+    int lines = 0;
+    for (size_t i = 0; i < n; i++) lines += t[i] == '\n';
+    rt_log("vk_pipeline: %s: %d crash%s in the driver; those pipelines are built without optimization, or skipped after "
+           "a second crash", path, lines, lines == 1 ? "" : "es");
+}
+static int crash_count(const char *note) {
+    int n = 0;
+    size_t len = strlen(note);
+    for (const char *at = crashed; at && (at = strstr(at, note)); at += len)
+        n += (at == crashed || at[-1] == '\n') && (at[len] == '\n' || at[len] == '\r');
+    return n;
+}
+
+static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t fs_off,
+                                  VkPipelineCache cache) {
+    if (gfx_shader_is_task(s->vs) || (s->ts && !mesh_vs(s))) {   // a task shader needs its mesh stage (PR #29, qiyuey)
+        rt_log("vk_pipeline: task shader requires a mesh stage");
+        return VK_NULL_HANDLE;
+    }
     if (s->gs && (l->set1 || !k->geometry_input || k->geometry_input > GFX_GEOMETRY_TRIANGLES_ADJACENCY)) return VK_NULL_HANDLE;
     VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE, gm = VK_NULL_HANDLE;
     uint64_t vw, fw;
@@ -2147,6 +2264,18 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         pin_subgroup32(st, &rq[stage_count], scode, sw);
         stage_count++;
     }
+    {
+        // Vulkan needs a vertex or a mesh stage (VUID-VkGraphicsPipelineCreateInfo-stage-02096). A vertex slot whose
+        // shader resolved to another stage gave the driver a pipeline without one: NVIDIA rejects it, AMD's can fault.
+        int pre_raster = 0;
+        for (uint32_t i = 0; i < stage_count; i++)
+            pre_raster |= stages[i].stage == VK_SHADER_STAGE_VERTEX_BIT || stages[i].stage == VK_SHADER_STAGE_MESH_BIT_EXT;
+        if (!pre_raster) {
+            LOG_ONCE("vk_pipeline: a graphics pipeline has no vertex or mesh stage (vertex slot is stage %#x); not built",
+                     stage_count ? (unsigned)stages[0].stage : 0u);
+            goto out;
+        }
+    }
     VkVertexInputAttributeDescription va[32];
     VkVertexInputBindingDescription vb[17];
     uint32_t na = 0, nb = 0;
@@ -2222,7 +2351,41 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         pi.pVertexInputState = NULL, pi.pInputAssemblyState = NULL;
     }
     uint64_t p0 = perf_begin();
-    VkResult r = vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe);
+    static _Thread_local char note[200];   // named in the log if the driver crashes in this create (platform last-chance filter)
+    {
+        const GfxShader *st[4] = {s->ts, s->vs, s->gs, s->fs};
+        int at = snprintf(note, sizeof note, "graphics pipeline, mesh %d task %d:", mesh_vs(s), s->ts != NULL);
+        for (int i = 0; i < 4 && at < (int)sizeof note; i++) {
+            uint64_t w = 0, h = 1469598103934665603ull;   // FNV-1a of the SPIR-V: the same shader across runs
+            const uint32_t *c = st[i] ? gfx_shader_spirv(st[i], &w) : NULL;
+            for (uint64_t j = 0; c && j < w; j++) h = (h ^ c[j]) * 1099511628211ull;
+            if (c) at += snprintf(note + at, sizeof note - at, " %s %llu words %016llx", (const char *[]){"ts", "vs", "gs", "fs"}[i],
+                                  (unsigned long long)w, (unsigned long long)h);
+        }
+    }
+    int crashes = crash_count(note);
+    if (crashes >= 2) {
+        static volatile int32_t told;
+        if (plat_inc32(&told) <= 8) rt_log("vk_pipeline: not built, the driver crashed in it twice: %s", note);
+        goto out;
+    }
+    if (crashes) {
+        pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+        rt_log("vk_pipeline: built without optimization, the driver crashed in it before: %s", note);
+    }
+    plat_crash_note(note);
+    int shared = cache && cache == P.cache;
+    if (shared) plat_mutex_lock_shared(&cache_access);
+    VkResult r = vkCreateGraphicsPipelines(P.device, cache, 1, &pi, NULL, &pipe);
+    // AMD's compiler gives up on large programs (-1, out of host memory, on an RX 6750 XT: the scene stayed black at
+    // 1 fps). Built again without optimization, as NotRexed/Hookshot's RX_VK_NOOPT does; NVIDIA never gets here.
+    if (r != VK_SUCCESS && vk_caps.amd && !(pi.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {
+        pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+        r = vkCreateGraphicsPipelines(P.device, cache, 1, &pi, NULL, &pipe);
+        rt_log("vk_pipeline: graphics pipeline built again without optimization: %s", r == VK_SUCCESS ? "ok" : "failed too");
+    }
+    if (shared) plat_mutex_unlock_shared(&cache_access);
+    plat_crash_note(NULL);
     perf_end(PERF_PIPE, p0);   // counts on the render thread only, so background builds stay out of it
     if (r != VK_SUCCESS) {
         rt_log("vk_pipeline: vkCreateGraphicsPipelines failed (%d)", (int)r);
@@ -2378,7 +2541,9 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         ri.depthAttachmentFormat = (VkFormat)k->depth, ri.stencilAttachmentFormat = (VkFormat)k->stencil;
         pi.pColorBlendState = &cb, pi.pMultisampleState = &ms;
     }
+    plat_mutex_lock_shared(&cache_access);
     if (vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+    plat_mutex_unlock_shared(&cache_access);
 out:
     if (m) vkDestroyShaderModule(P.device, m, NULL);
     free(patched);
@@ -2604,6 +2769,7 @@ typedef struct Job {
     uint32_t fs_off;
     uint8_t low;                       // in the low queue, or running at below-normal priority
     uint8_t prebuild, demanded;        // from the key file; a draw asked for it before it was ready
+    uint8_t large;                     // keep in the low queue so ordinary draws retain a worker
     int worker;                        // running on A.thread[worker]; -1 queued
     VkPipeState s;
     GKey k;
@@ -2634,11 +2800,15 @@ static struct {
 // built the pipeline and appended by the present thread (vk_pipeline_autosave) or at exit (vk_pipeline_save). A file
 // with another magic, version or record size is ignored and rewritten. Bump KEYS_VERSION when VkPipeState or the
 // record changes meaning without changing size.
-#define KEYS_VERSION 3                 // 3: shaders named by input id (gfx_shader.c)
+#define KEYS_VERSION 4                 // 3: shaders named by input id (gfx_shader.c); 4: the task stage too
 typedef struct { char magic[8]; uint32_t version, rec_size; } KeysHeader;
 typedef struct {
     uint8_t vs[32], fs[32];            // gfx_shader_input_id of each stage; fs all zero with has_fs 0
     uint32_t has_fs, pad;
+    // LOCAL TEST (Ocarina): a mesh pipeline's task stage (vs holds the mesh stage). Mesh pipelines were left out, and the
+    // Deku Tree scene still built them on a first start after the shader preparation (8.4 s).
+    uint8_t ts[32];
+    uint32_t has_ts, pad2;
     // Frozen two-stage prefix. Adding the experimental GS pointer must not
     // change existing version-3 records or reinterpret their bytes at boot.
     _Alignas(VkPipeState) uint8_t state[offsetof(VkPipeState, gs)];
@@ -2695,15 +2865,16 @@ static void rec_fill(KeyRec *r, const VkPipeState *s) {
     memset(r, 0, sizeof *r);
     memcpy(r->vs, gfx_shader_input_id(s->vs), 32);
     if (s->fs) memcpy(r->fs, gfx_shader_input_id(s->fs), 32), r->has_fs = 1;
+    if (s->ts) memcpy(r->ts, gfx_shader_input_id(s->ts), 32), r->has_ts = 1;
     VkPipeState legacy = *s;
-    legacy.vs = legacy.fs = legacy.gs = NULL;
+    legacy.vs = legacy.fs = legacy.gs = legacy.ts = NULL;
     legacy.prim_restart = 0;   // dynamic state: the same pipeline either way
     memcpy(r->state, &legacy, sizeof r->state);
 }
 
 // A pipeline was built for a draw: queue its record for the file. Caller holds P.lock.
 static void keys_note(const VkPipeState *s) {
-    if (s->gs || mesh_vs(s) || !A.on || !K.path[0]) return;             // GS prewarm records need a future explicit format
+    if (s->gs || !A.on || !K.path[0]) return;             // GS prewarm records need a future explicit format
     KeyRec r;
     rec_fill(&r, s);
     if (!seen_add(rec_hash(&r))) return;
@@ -2742,6 +2913,7 @@ static void keys_flush(void) {
     plat_mutex_unlock(&K.io);
 }
 
+static void crashed_open(const char *keys_path);
 // Reads the key file into K.file and its record hashes into the set. Caller holds P.lock (ensure_init).
 static void keys_open(void) {
     if (!A.on || !P.cache_path[0]) return;
@@ -2750,6 +2922,7 @@ static void keys_open(void) {
     if (fslash > slash) slash = fslash;
     snprintf(slash ? slash + 1 : K.path, sizeof K.path - (size_t)(slash ? slash + 1 - K.path : 0), "pipeline-keys.bin");
     gfx_shader_record_at(K.path);   // shader-answers.bin next to it (gfx_shader.c)
+    crashed_open(K.path);
     FILE *f = fopen(K.path, "rb");
     if (!f) return;
     KeysHeader h;
@@ -2842,7 +3015,14 @@ static void pipe_worker(void *arg) {
             }
         }
         plat_mutex_unlock(&P.lock);
-        VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off);
+        // As with the big compute worker, do not hold the shared driver
+        // cache during a large compilation.
+        VkPipelineCache own = j->large ? cache_private() : VK_NULL_HANDLE;
+        VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off, own ? own : P.cache);
+        if (own) {
+            if (pipe) cache_publish(own);
+            else vkDestroyPipelineCache(P.device, own, NULL);
+        }
         plat_mutex_lock(&P.lock);
         if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
         if (pipe && j->p->fast) P.g.swaps++;
@@ -2891,7 +3071,8 @@ static void workers_drain(void) {
     for (Job *j = A.low, *n; j; j = n) {   // queued prebuild jobs are dropped, not built
         n = j->next;
         j->p->building = 0, j->p->job = NULL;
-        A.inflight--, K.left--;
+        A.inflight--;
+        if (j->prebuild) K.left--;
         free(j);
     }
     A.low = A.low_tail = NULL;
@@ -2919,7 +3100,7 @@ int vk_pipeline_async_on(void) { return A.on; }
 // Caller holds P.lock.
 static void promote(Pipe *p) {
     Job *j = p->job;
-    if (!j || !j->low) return;
+    if (!j || !j->low || j->large) return;
     j->low = 0, j->demanded = 1;
     if (j->worker < 0) {
         if (j->prev) j->prev->next = j->next;
@@ -2935,6 +3116,12 @@ static void promote(Pipe *p) {
         A.prio_low[j->worker] = 0;
         plat_thread_set_priority(A.thread[j->worker], PLAT_PRIO_NORMAL);
     }
+}
+
+static uint64_t graphics_shader_words(const GfxShader *shader) {
+    uint64_t words = 0;
+    if (shader) gfx_shader_spirv(shader, &words);
+    return words;
 }
 
 // Enters a missing pipeline: built here (mode 0), or queued for a draw (1) or for the prebuild (2). Failures are
@@ -2964,8 +3151,12 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
     VkPipeline pipe = VK_NULL_HANDLE;
     Job *j = NULL;
     if (!why && mode && workers_start() && (j = calloc(1, sizeof *j))) {
-        *j = (Job){.l = l, .fs_off = fs_off, .low = mode == 2, .prebuild = mode == 2, .worker = -1, .s = *s, .k = *k};
-    } else if (!why && !(pipe = create_graphics(s, k, l, fs_off))) {
+        int large = mode == 1 && vk_caps.amd && !P.gpl && U.on && A.threads >= 3 &&
+                    graphics_shader_words(s->vs) + graphics_shader_words(s->fs) +
+                    graphics_shader_words(s->gs) + graphics_shader_words(s->ts) >= 60000;
+        *j = (Job){.l = l, .fs_off = fs_off, .low = mode == 2 || large, .prebuild = mode == 2,
+                   .large = large, .worker = -1, .s = *s, .k = *k};
+    } else if (!why && !(pipe = create_graphics(s, k, l, fs_off, P.cache))) {
         why = "pipeline creation failed";
     }
     if (why) {
@@ -2982,12 +3173,12 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
     }
     j->p = p;
     p->building = 1, p->job = j;
-    if (mode == 2) {
+    if (j->low) {
         j->prev = A.low_tail;
         if (A.low_tail) A.low_tail->next = j;
         else A.low = j;
         A.low_tail = j;
-        K.left++;
+        if (j->prebuild) K.left++;
     } else {
         if (A.tail) A.tail->next = j;
         else A.head = j;
@@ -3098,6 +3289,13 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
                       : "builds its libraries itself (TOTK_PIPE_WAIT=draw)");
     }
     double end = wait_ms ? now_ms() + wait_ms : 0;
+    // An ordinary full-screen wait is at most 50 ms. If a one-shot wait
+    // times out, later frames can keep drawing with the available pipelines
+    // while the same slow AMD driver job continues in the background.
+    if (p && p->building && async && vk_caps.amd && !P.gpl && wait_ms > 50) {
+        if (!p->one_shot_deadline_ms) p->one_shot_deadline_ms = end;
+        else if (end > p->one_shot_deadline_ms) end = p->one_shot_deadline_ms;
+    }
     if (p && p->building && P.gpl && !s->gs && !mesh_vs(s) && !p->info.pipeline && !p->fast_tried && p->lay) {
         int final = 0, build = wait_ms != 0 && draw_build;
         uint64_t p0 = perf_begin(), t0 = qpc();
@@ -3172,7 +3370,7 @@ static void warm_builder(void *arg) {
         j->next = j->prev = NULL;
         j->low = 0;                    // not on a pool thread: promote() has nothing to raise
         plat_mutex_unlock(&P.lock);
-        VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off);
+        VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off, P.cache);
         plat_mutex_lock(&P.lock);
         if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
         if (pipe && j->p->fast) P.g.swaps++;
@@ -3213,8 +3411,8 @@ void vk_pipeline_prewarm(void) {
     }
     const KeyRec *r = (const KeyRec *)K.file;
     size_t n = K.file_n, m = 0;
-    uint8_t (*ids)[32] = malloc(2 * n * 32);
-    const GfxShader **sh = calloc(2 * n, sizeof *sh);
+    uint8_t (*ids)[32] = malloc(3 * n * 32);
+    const GfxShader **sh = calloc(3 * n, sizeof *sh);
     if (!ids || !sh) {
         free(ids), free(sh);
         return;
@@ -3222,6 +3420,7 @@ void vk_pipeline_prewarm(void) {
     for (size_t i = 0; i < n; i++) {
         memcpy(ids[m++], r[i].vs, 32);
         if (r[i].has_fs) memcpy(ids[m++], r[i].fs, 32);
+        if (r[i].has_ts) memcpy(ids[m++], r[i].ts, 32);
     }
     qsort(ids, m, 32, id_cmp);
     size_t u = 0;
@@ -3247,21 +3446,30 @@ void vk_pipeline_prewarm(void) {
         rt_log("vk_pipeline: vertex output unions: %u vertex shaders, %.2f locations each; %llu pairs read %.2f each",
                VO.n, VO.n ? (double)uni / VO.n : 0.0, (unsigned long long)pairs, pairs ? (double)pair / pairs : 0.0);
     }
-    uint32_t queued = 0, dropped = 0, known = 0;
+    uint32_t queued = 0, dropped = 0, known = 0, deferred = 0;
     plat_mutex_lock(&P.lock);
     K.t0 = t1;
     K.loading = 1;
     for (size_t i = 0; i < n; i++) {
         const uint8_t (*v)[32] = bsearch(r[i].vs, ids, u, 32, id_cmp);
         const uint8_t (*f)[32] = r[i].has_fs ? bsearch(r[i].fs, ids, u, 32, id_cmp) : NULL;
-        const GfxShader *vs = v ? sh[v - ids] : NULL, *fs = f ? sh[f - ids] : NULL;
-        if (!vs || (r[i].has_fs && !fs)) {
+        const uint8_t (*tq)[32] = r[i].has_ts ? bsearch(r[i].ts, ids, u, 32, id_cmp) : NULL;
+        const GfxShader *vs = v ? sh[v - ids] : NULL, *fs = f ? sh[f - ids] : NULL, *ts = tq ? sh[tq - ids] : NULL;
+        if (!vs || (r[i].has_fs && !fs) || (r[i].has_ts && !ts)) {
             dropped++;
             continue;
         }
+        if (A.on && vk_caps.amd) {
+            // Let the draw queue compile large shaders on demand. AMD can
+            // spend minutes on one of these, blocking the startup join.
+            if (graphics_shader_words(vs) + graphics_shader_words(fs) + graphics_shader_words(ts) >= 60000) {
+                deferred++;
+                continue;
+            }
+        }
         VkPipeState s = {0};
         memcpy(&s, r[i].state, sizeof r[i].state);
-        s.vs = vs, s.fs = fs;
+        s.vs = vs, s.fs = fs, s.ts = ts;
         GKey k;
         gkey_fill(&s, &k);
         pr_hist[(k.clamp & 1) | (k.poly_mode & 3) << 1 | (k.minus_w & 1) << 3]++;
@@ -3285,9 +3493,9 @@ void vk_pipeline_prewarm(void) {
             rt_log("vk_pipeline: prewarm: %u of %u pipelines, %.0f ms", K.built + K.failed, queued, now_ms() - t1);
     plat_mutex_lock(&P.lock);
     while (K.left) plat_cond_wait(&done_cv, &P.lock);   // jobs a pool worker took
-    rt_log("vk_pipeline: prewarm: %zu records in %s: %u pipelines built, %u failed, %u already built, %u dropped "
+    rt_log("vk_pipeline: prewarm: %zu records in %s: %u pipelines built, %u failed, %u already built, %u deferred, %u dropped "
            "(shader neither cached nor stored); shaders %.0f ms, pipelines %.0f ms on %d threads, total %.0f ms",
-           n, K.path, K.built, K.failed, known, dropped, t1 - t0, now_ms() - t1, nt, now_ms() - t0);
+           n, K.path, K.built, K.failed, known, deferred, dropped, t1 - t0, now_ms() - t1, nt, now_ms() - t0);
     free(K.file);
     K.file = NULL;
     plat_mutex_unlock(&P.lock);
@@ -3345,7 +3553,14 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
         if (ci.stage.pNext && ls[0] && ls[0] % vk_caps.sg_size == 0) ci.stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
     }
     VkPipeline pipe = VK_NULL_HANDLE;
+    if (!cs_build_cache) plat_mutex_lock_shared(&cache_access);
     if (vkCreateComputePipelines(P.device, cs_build_cache ? cs_build_cache : P.cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+    if (!pipe && vk_caps.amd && !(ci.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {   // as for graphics, above
+        ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+        if (vkCreateComputePipelines(P.device, cs_build_cache ? cs_build_cache : P.cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+        rt_log("vk_pipeline: compute pipeline built again without optimization: %s", pipe ? "ok" : "failed too");
+    }
+    if (!cs_build_cache) plat_mutex_unlock_shared(&cache_access);
     vkDestroyShaderModule(P.device, m, NULL);
     return pipe;
 }
@@ -3391,7 +3606,7 @@ static struct {
     uint8_t clamp, poly, minus_w, samples;             // library state (GKey fields)
     double t0, ms[3];                                  // ms: build time per kind (vertex, fragment, compute)
     // warmed: driver cache only; nolib: vertex and fragment variants skipped with the graphics pipeline library off
-    uint64_t built[3], have[3], fail[3], warmed[3], noshader, nolib, done, cs_draw;
+    uint64_t built[3], have[3], fail[3], warmed[3], noshader, nolib, done, cs_draw, big_skipped;
     double warm_ms[3];
     volatile int32_t kept;                                // libraries entered in libs[] so far
     int32_t keep_n;
@@ -3401,7 +3616,7 @@ static struct {
 
 // LOCAL TEST (Ocarina): compute shaders with guarded candidates reach 17-30 MB of SPIR-V; the driver takes a minute or more and over 30 GB
 // for one, and it ran on the replay thread under P.lock: the game froze at the first broken pot. A big shader is built here first, one at a
-// time, so memory stays bounded, and its dispatches are skipped until then; vk_pipeline_compute then finds it in the driver's pipeline cache.
+// time, so memory stays bounded, and its dispatches are skipped until the pipeline is in the live table.
 // ponytail: a linear table of 1024 shaders and a polling worker; a dispatch skipped this way loses its effect for those frames.
 enum { BIG_CS_N = 1024 };
 static struct { const GfxShader *cs; volatile int done; } big_cs[BIG_CS_N];
@@ -3423,20 +3638,32 @@ static void big_cs_worker(void *arg) {
         plat_mutex_unlock(&P.lock);
         uint64_t t0 = plat_now_ns();
         // A cache of its own: a compile of minutes inside the shared cache held every other pipeline on the replay thread
-        // behind it, and the game froze for over a minute. The result is merged into the shared one when it is done.
-        VkPipelineCacheCreateInfo cci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-        VkPipelineCache own = VK_NULL_HANDLE;
-        if (P.cache) vkCreatePipelineCache(P.device, &cci, NULL, &own);
+        // behind it, and the game froze for over a minute.
+        VkPipelineCache own = cache_private();
         cs_build_cache = own;
         VkPipeline pipe = why ? VK_NULL_HANDLE : compute_create(cs, l);
         cs_build_cache = VK_NULL_HANDLE;
-        if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
-        if (own) {
-            vkMergePipelineCaches(P.device, P.cache, 1, &own);
-            vkDestroyPipelineCache(P.device, own, NULL);
+        // Kept, as lb_compute keeps its pipelines: built again on the replay thread, the driver's cache missed and the game froze for
+        // the whole compile a second time (62 s after big compute shader 31, a 21-minute run).
+        int built = pipe != VK_NULL_HANDLE;
+        if (pipe) {
+            struct { const GfxShader *cs; uint32_t compute; } k = {cs, 1};
+            uint64_t h = key_hash(&k, sizeof k);
+            plat_mutex_lock(&P.lock);
+            if (!pipe_find(&k, sizeof k, h)) {
+                pipe_add(&k, sizeof k, h, pipe, l, &B, VK_PIPELINE_BIND_POINT_COMPUTE, 0);
+                P.stats.compute++;
+                pipe = VK_NULL_HANDLE;
+            }
+            plat_mutex_unlock(&P.lock);
+            if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
         }
-        rt_log("vk_pipeline: big compute shader %d built in %.1f s%s", next, (double)(plat_now_ns() - t0) / 1e9, pipe ? "" : " (failed)");
+        rt_log("vk_pipeline: big compute shader %d built in %.1f s%s", next, (double)(plat_now_ns() - t0) / 1e9, built ? "" : " (failed)");
         __atomic_store_n(&big_cs[next].done, 1, __ATOMIC_RELEASE);
+        if (own) {
+            if (built) cache_publish(own);
+            else vkDestroyPipelineCache(P.device, own, NULL);
+        }
         next++;
     }
 }
@@ -3539,6 +3766,13 @@ static uint32_t vs_union_peek(const GfxShader *vs, GfxShaderIo fin[32]) {
 }
 
 static void lb_compute(const GfxShader *cs) {
+    // LOCAL TEST (Ocarina): a big shader is left to big_cs_worker (one at a time, its own cache, only once a dispatch needs it).
+    // Here it was built on every prebuild thread at once in the shared cache, including the skipped movie network (up to 7 million
+    // words): on AMD (LLPC) those compiles ran for many minutes, the graphics pipelines waited behind them and the scene after the
+    // intro stayed black (ocarina-recomp #12, #20, #27).
+    uint64_t words = 0;
+    gfx_shader_spirv(cs, &words);
+    if (words >= big_cs_words()) return;
     struct { const GfxShader *cs; uint32_t compute; } k = {cs, 1};
     uint64_t h = key_hash(&k, sizeof k);
     Bindings B = {0};
@@ -3639,7 +3873,7 @@ static void lb_report(const char *how) {
     plat_mutex_lock_shared(&LB.stat);
     rt_log("vk_pipeline: stage library prebuild %s: %llu of %zu variants in %.0f ms; kept: vertex %llu built (avg %.1f ms), "
            "%llu there; fragment %llu built (avg %.1f ms), %llu there; compute %llu built (avg %.1f ms), %llu there; driver "
-           "cache only: vertex %llu (avg %.1f ms), fragment %llu (avg %.1f ms), compute %llu (avg %.1f ms); %llu failed, %llu not in the shader cache, "
+           "cache only: vertex %llu (avg %.1f ms), fragment %llu (avg %.1f ms), compute %llu (avg %.1f ms); %llu failed, %llu big compute left to play, %llu not in the shader cache, "
            "%llu vertex/fragment skipped (graphics pipeline library off); process working set %.0f MB", how, (unsigned long long)LB.done, LB.n,
            now_ms() - LB.t0, (unsigned long long)LB.built[0], LB.built[0] ? LB.ms[0] / LB.built[0] : 0.0,
            (unsigned long long)LB.have[0], (unsigned long long)LB.built[1], LB.built[1] ? LB.ms[1] / LB.built[1] : 0.0,
@@ -3647,7 +3881,7 @@ static void lb_report(const char *how) {
            (unsigned long long)LB.have[2], (unsigned long long)LB.warmed[0], LB.warmed[0] ? LB.warm_ms[0] / LB.warmed[0] : 0.0,
            (unsigned long long)LB.warmed[1], LB.warmed[1] ? LB.warm_ms[1] / LB.warmed[1] : 0.0,
            (unsigned long long)LB.warmed[2], LB.warmed[2] ? LB.warm_ms[2] / LB.warmed[2] : 0.0,
-           (unsigned long long)(LB.fail[0] + LB.fail[1] + LB.fail[2]),
+           (unsigned long long)(LB.fail[0] + LB.fail[1] + LB.fail[2]), (unsigned long long)LB.big_skipped,
            (unsigned long long)LB.noshader, (unsigned long long)LB.nolib, (double)mem_proc);
     plat_mutex_unlock_shared(&LB.stat);
 }
@@ -3694,7 +3928,7 @@ static void lb_state(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
 // Boot: compute shaders of the warm list (recorded and prepared), then the first KEEP recorded graphics variants.
 static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     const char *e = cfg_value("TOTK_LIB_PREBUILD"), *ke = cfg_get("TOTK_LIB_PREBUILD_KEEP");
-    const char *te = cfg_get("TOTK_LIB_PREBUILD_THREADS");   // no fixed default: a quarter of the CPUs when unset
+    const char *te = cfg_get("TOTK_LIB_PREBUILD_THREADS");   // explicit overrides keep their existing meaning
     if (!A.on || !cfg_bool("TOTK_LIB_PREBUILD")) return;
     GfxWarmEnt *all = NULL;
     size_t total = gfx_shader_warm_list(&all), n = 0, n_cs = 0;
@@ -3715,7 +3949,11 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     lb_state(pr_hist, fs_hist);
     LB.idle = 1;
     int cpus = (int)plat_cpu_usable();
-    int t = te && *te ? atoi(te) : cpus / 4;
+    // Speculative NVIDIA builds can slow foreground replay despite idle worker
+    // priority. Keep prebuild enabled, but serialize its default worker pool.
+    const VkCtx *ctx = vk_ctx();
+    int default_threads = ctx && ctx->props.vendorID == 0x10de ? 1 : cpus / 4;
+    int t = te && *te ? atoi(te) : default_threads;
     t = t < 1 ? 1 : t > LB_MAX_THREADS ? LB_MAX_THREADS : t;
     if ((size_t)t > n) t = (int)n;
     LB.t0 = now_ms();
@@ -3747,9 +3985,16 @@ static void lb_warm_worker(void *arg) {
         int owned = 0;
         const GfxShader *sh = gfx_shader_load_private(LB.e[i].iid, &owned);
         int st = sh ? gfx_shader_stage(sh) : -1;
+        uint64_t words = 0;
         if (!sh) {
             plat_mutex_lock(&LB.stat);
             LB.noshader++;
+            plat_mutex_unlock(&LB.stat);
+        } else if (st == GFX_STAGE_CS && gfx_shader_spirv(sh, &words) && words >= big_cs_words()) {
+            // As lb_compute: a big shader is left to big_cs_worker in play. Here it held the preparation for many minutes
+            // (some are the movie network the game skips, up to 7 million words). Suggested by robk3 on issue #15.
+            plat_mutex_lock(&LB.stat);
+            LB.big_skipped++;
             plat_mutex_unlock(&LB.stat);
         } else if (st == GFX_STAGE_CS) {
             Bindings B = {0};
@@ -3954,8 +4199,24 @@ void vk_pipeline_save(void) {
     }
     size_t size = 0;
     void *data = NULL;
-    if (vkGetPipelineCacheData(P.device, P.cache, &size, NULL) == VK_SUCCESS && size && (data = malloc(size)) &&
-        vkGetPipelineCacheData(P.device, P.cache, &size, data) == VK_SUCCESS) {
+    cache_retry_deferred();
+    // Exclusive: Intel's driver (Arc 140V, 101.8991) reads a null pointer in vkGetPipelineCacheData (igvk64.dll+0x653291,
+    // the "pipe autosave" thread) while another thread builds a pipeline into the same cache. trylock, so a waiting
+    // save never holds back the replay's builds behind a compile of seconds.
+    while (!plat_mutex_trylock(&cache_access)) plat_sleep_ms(2);
+    plat_mutex_lock(&deferred_access);
+    VkPipelineCache snapshot = P.cache;
+    // A driver compile may still be using the shared cache. Persist the
+    // union via the deferred cache without waiting for an exclusive lock.
+    if (deferred_cache) {
+        if (vkMergePipelineCaches(P.device, deferred_cache, 1, &P.cache) == VK_SUCCESS) snapshot = deferred_cache;
+        else rt_log("vk_pipeline: could not include deferred pipelines in cache save");
+    }
+    int got = vkGetPipelineCacheData(P.device, snapshot, &size, NULL) == VK_SUCCESS && size && (data = malloc(size)) &&
+              vkGetPipelineCacheData(P.device, snapshot, &size, data) == VK_SUCCESS;
+    plat_mutex_unlock(&deferred_access);
+    plat_mutex_unlock(&cache_access);
+    if (got) {
         if (!plat_file_write_atomic(P.cache_path, data, size)) rt_log("vk_pipeline: cannot write %s", P.cache_path);
     }
     free(data);
@@ -3965,16 +4226,19 @@ void vk_pipeline_save(void) {
 // The game never shuts the device down (boot.c and the window end the process), so the cache is saved while it
 // runs: at most every 20 s, and only after new pipelines were built. New pipeline keys are appended every 2 s.
 static void autosave_once(void) {
-    static uint64_t last_n, last_ms, last_keys;
+    static uint64_t last_n, last_updates, last_ms, last_keys;
     if (!P.ready) return;
+    cache_retry_deferred();
     uint64_t now = plat_now_ms();
     if (*(volatile uint32_t *)&K.pend_n && now - last_keys >= 2000) last_keys = now, keys_flush();
     gfx_shader_record_flush(0);
     if (now - last_ms < 20000) return;
     VkPipeStats s;
     vk_pipeline_stats(&s);
-    if (s.graphics + s.compute == last_n) return;
+    uint64_t updates = __atomic_load_n(&cache_updates, __ATOMIC_RELAXED);
+    if (s.graphics + s.compute == last_n && updates == last_updates) return;
     last_n = s.graphics + s.compute, last_ms = now;
+    last_updates = updates;
     vk_pipeline_save();
 }
 
@@ -4028,8 +4292,15 @@ void vk_pipeline_shutdown(void) {
         layouts[i] = NULL;
     }
     plat_mutex_lock(&save_lock);   // not while the autosave thread copies it
+    plat_mutex_lock(&cache_access);
+    plat_mutex_lock(&deferred_access);
+    if (deferred_cache) vkDestroyPipelineCache(P.device, deferred_cache, NULL);
+    deferred_cache = VK_NULL_HANDLE;
+    deferred_count = 0;
+    plat_mutex_unlock(&deferred_access);
     if (P.cache) vkDestroyPipelineCache(P.device, P.cache, NULL);
     P.cache = VK_NULL_HANDLE;
+    plat_mutex_unlock(&cache_access);
     plat_mutex_unlock(&save_lock);
     memset(&P.stats, 0, sizeof P.stats);
     plat_xchg32(&P.ready, 0);
