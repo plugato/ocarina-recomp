@@ -71,6 +71,8 @@ typedef struct {
     Slot last;         // the newest picture, for packets that show none
     Packet queue[QUEUED];
     int qhead, qn;
+    uint32_t gen;      // bumped by init, flush and finalize: a packet the worker took before it is dropped
+    int pending;       // packets handed to the worker whose pictures will fill waiting buffers
 } Dec;
 
 static Dec decs[DECODERS];
@@ -180,19 +182,39 @@ static int av1_decode(Dec *d, const uint8_t *data, size_t size, vpx_image_t *out
     return 1;
 }
 
-static int decode_into(Dec *d, Slot *s, const uint8_t *data, size_t size, int64_t pts, int end, uint64_t wake[WAITERS]) {
+// TOTK_TRACE=perf: wall time of the decode and of the NV12 conversion, every 300 pictures.
+static struct { uint64_t n, dec_ns, conv_ns, max_ns; } dstat;
+
+// The decoder's part of a packet: the picture it shows, or NULL. The image stays valid until the next call. Called by
+// one thread at a time: the codec worker, or a guest thread holding `lock` when decoding is synchronous.
+static const vpx_image_t *decode_packet(Dec *d, const uint8_t *data, size_t size, vpx_image_t *av1_img) {
     const vpx_image_t *img = NULL, *f;
-    vpx_image_t av1_img;
     if (d->av1) {
-        if (data && size && av1_decode(d, data, size, &av1_img)) img = &av1_img;
+        if (data && size && av1_decode(d, data, size, av1_img)) img = av1_img;
     } else if (d->vpx_ok && data && size) {
         if (vpx_codec_decode(&d->vpx, data, (unsigned)size, NULL, 0) != VPX_CODEC_OK)
             LOG_FIRST("codec: VP9 packet of %zu bytes failed: %s", size, vpx_codec_error_detail(&d->vpx));
         vpx_codec_iter_t it = NULL;
         while ((f = vpx_codec_get_frame(&d->vpx, &it))) img = f;   // a superframe shows at most one; keep the last
     }
+    return img;
+}
+
+// The buffer's part (lock held): s gets img, or at the end the last picture (or black). t0..t1: the decode's wall time.
+static int finish_into(Dec *d, Slot *s, const vpx_image_t *img, size_t size, int64_t pts, int end, uint64_t wake[WAITERS],
+                       uint64_t t0, uint64_t t1) {
     int filled = 1;
     if (img) put_picture(s, img), copy_slot(&d->last, s);
+    if (img && (rt_trace & RT_TRACE_PERF)) {
+        uint64_t t2 = plat_now_ns();
+        dstat.n++, dstat.dec_ns += t1 - t0, dstat.conv_ns += t2 - t1;
+        if (t2 - t0 > dstat.max_ns) dstat.max_ns = t2 - t0;
+        if (dstat.n == 300) {
+            rt_log("perf: codec: %llu pictures, decode %.2f ms avg, conversion and copies %.2f ms avg, slowest %.2f ms",
+                   (unsigned long long)dstat.n, dstat.dec_ns / 1e6 / dstat.n, dstat.conv_ns / 1e6 / dstat.n, dstat.max_ns / 1e6);
+            memset(&dstat, 0, sizeof dstat);
+        }
+    }
     if (img) {   // LOCAL TEST: is the movie really decoded? The mean luma of the first pictures
         static int shown;
         if (shown++ < 8 || shown % 300 == 0) {
@@ -223,6 +245,112 @@ static int decode_into(Dec *d, Slot *s, const uint8_t *data, size_t size, int64_
     return n;
 }
 
+// Decodes one packet into the waiting buffer s on the calling thread (lock held): the synchronous path.
+static int decode_into(Dec *d, Slot *s, const uint8_t *data, size_t size, int64_t pts, int end, uint64_t wake[WAITERS]) {
+    vpx_image_t av1_img;
+    uint64_t t0 = plat_now_ns();
+    const vpx_image_t *img = decode_packet(d, data, size, &av1_img);
+    return finish_into(d, s, img, size, pts, end, wake, t0, plat_now_ns());
+}
+
+// ---- asynchronous decoding (OOT_CODEC_SYNC=1 decodes on the guest thread inside Submit and Acquire, as before)
+// The player waits for a picture through its buffer's fence (RequestSyncPointEvent, TryWaitNativeSync), so Submit need
+// not return with the picture decoded. A 1080p AV1 picture took 12-15 ms of the guest thread on a Ryzen 5 5600 (the
+// title screen's movie), most of a frame. A host thread takes the packets in submission order, decodes them without
+// `lock`, then fills the oldest waiting buffer and signals its waiters: the buffer the guest-thread decode would have
+// chosen, as pictures fill buffers in acquisition order either way.
+enum { JOBS = DECODERS * (SLOTS + QUEUED) };
+typedef struct { Dec *d; uint32_t gen; Packet p; } Job;
+static Job jobs[JOBS];
+static int job_head, job_n;
+static Dec *busy;   // the decoder the worker is decoding for, outside `lock`
+static PlatCond jcond = PLAT_COND_INIT, idle = PLAT_COND_INIT;
+static int worker;  // 0 not started, 1 running, -1 could not start (synchronous from then on)
+
+static int codec_async(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("OOT_CODEC_SYNC");
+        on = !(e && *e && *e != '0');
+    }
+    return on && worker >= 0;
+}
+
+// Waiting buffers that no packet handed to the worker is headed for (lock held).
+static int avail(const Dec *d) {
+    int n = 0;
+    for (int i = 0; i < SLOTS; i++) n += d->slot[i].state == S_WAIT;
+    return n - d->pending;
+}
+
+static void job_push(Dec *d, Packet p) {   // lock held, job_n < JOBS
+    jobs[(job_head + job_n++) % JOBS] = (Job){d, d->gen, p};
+    d->pending++;
+    plat_cond_signal(&jcond);
+}
+
+// Hands queued packets to the worker while buffers wait for their pictures (lock held).
+static void feed(Dec *d) {
+    while (d->qn && avail(d) > 0 && job_n < JOBS) {
+        Packet q = d->queue[d->qhead];
+        d->qhead = (d->qhead + 1) % QUEUED, d->qn--;
+        job_push(d, q);
+    }
+}
+
+// Drops d's packets not decoded yet and waits until the worker is not decoding for d, so the caller may close, flush
+// or reset the decoder (lock held).
+static void quiesce(Dec *d) {
+    d->gen++;
+    int k = 0;
+    for (int i = 0; i < job_n; i++) {
+        Job j = jobs[(job_head + i) % JOBS];
+        if (j.d == d) free(j.p.data);
+        else jobs[(job_head + k++) % JOBS] = j;
+    }
+    job_n = k;
+    while (busy == d) plat_cond_wait(&idle, &lock);
+    d->pending = 0;
+}
+
+static void worker_main(void *arg) {
+    (void)arg;
+    plat_mutex_lock(&lock);
+    for (;;) {
+        while (!job_n) plat_cond_wait(&jcond, &lock);
+        Job j = jobs[job_head];
+        job_head = (job_head + 1) % JOBS, job_n--;
+        Dec *d = j.d;
+        if (j.gen != d->gen) {
+            free(j.p.data);
+            continue;
+        }
+        busy = d;
+        plat_mutex_unlock(&lock);
+        vpx_image_t av1_img;
+        uint64_t t0 = plat_now_ns();
+        const vpx_image_t *img = decode_packet(d, j.p.data, j.p.size, &av1_img);
+        uint64_t t1 = plat_now_ns();
+        plat_mutex_lock(&lock);
+        busy = NULL;
+        uint64_t wake[WAITERS];
+        int n = 0;
+        if (j.gen == d->gen) {
+            d->pending--;
+            Slot *s = oldest_wait(d);
+            if (s) n = finish_into(d, s, img, j.p.size, j.p.pts, j.p.end, wake, t0, t1);
+            feed(d);
+        }
+        plat_cond_broadcast(&idle);
+        free(j.p.data);
+        if (n) {
+            plat_mutex_unlock(&lock);
+            for (int i = 0; i < n; i++) kern_signal_system_event(wake[i]);
+            plat_mutex_lock(&lock);
+        }
+    }
+}
+
 // Result nn::codec::video::Initialize(), Finalize(): nothing to open on the host
 static void ov_video_init(Cpu *c) { ret_x(c, 0); }
 static void ov_video_fini(Cpu *c) { ret_x(c, 0); }
@@ -232,13 +360,15 @@ static void vp9_init(Cpu *c, uint64_t key, unsigned w, unsigned h) {
     Dec *d = dec_of(key);
     if (!d) d = dec_of(0);
     if (!d) rt_fatal("codec: more than %d VP9 decoders", DECODERS);
+    quiesce(d);
+    uint32_t gen = d->gen;
     if (d->vpx_ok) vpx_codec_destroy(&d->vpx);
     if (d->av1) dav1d_close(&d->av1);
     for (int i = 0; i < SLOTS; i++) free(d->slot[i].nv12);
     free(d->last.nv12);
     queue_drop(d);
     memset(d, 0, sizeof *d);
-    d->key = key;
+    d->key = key, d->gen = gen;
     vpx_codec_dec_cfg_t cfg = {.threads = 2, .w = w, .h = h};
     d->vpx_ok = vpx_codec_dec_init(&d->vpx, vpx_codec_vp9_dx(), &cfg, 0) == VPX_CODEC_OK;
     plat_mutex_unlock(&lock);
@@ -256,12 +386,15 @@ static void ov_vp9_fini(Cpu *c) {
     plat_mutex_lock(&lock);
     Dec *d = dec_of(arg_x(c, 0));
     if (d) {
+        quiesce(d);
+        uint32_t gen = d->gen;
         if (d->vpx_ok) vpx_codec_destroy(&d->vpx);
         if (d->av1) dav1d_close(&d->av1);
         for (int i = 0; i < SLOTS; i++) free(d->slot[i].nv12);
         free(d->last.nv12);
         queue_drop(d);
         memset(d, 0, sizeof *d);
+        d->gen = gen;
     }
     plat_mutex_unlock(&lock);
     ret_x(c, 0);
@@ -271,6 +404,7 @@ static void ov_vp9_fini(Cpu *c) {
 static void ov_vp9_flush(Cpu *c) {
     plat_mutex_lock(&lock);
     Dec *d = dec_of(arg_x(c, 0));
+    if (d) quiesce(d);   // packets handed to the worker are dropped too
     if (d)
         for (int i = 0; i < SLOTS; i++)
             if (d->slot[i].state == S_FILLED) d->slot[i].state = S_WAIT;   // still reserved; its picture is dropped
@@ -361,6 +495,24 @@ static void ov_vp9_submit(Cpu *c) {
     int end = (int)(arg_x(c, 5) & 1);
     plat_mutex_lock(&lock);
     Dec *d = dec_of(arg_x(c, 1));
+    if (d && codec_async() && !worker) worker = plat_thread_spawn(worker_main, NULL, "codec", 0) ? 1 : -1;
+    if (d && codec_async()) {   // the packet goes to the worker, or waits in the queue for a buffer
+        int direct = !d->qn && avail(d) > 0 && job_n < JOBS, queued = !direct && d->qn < QUEUED;
+        if (direct || queued) {
+            Packet q = {size ? malloc(size) : NULL, size, pts, end};
+            if (size && !q.data) rt_fatal("codec: out of memory for a %zu-byte packet", size);
+            if (size) memcpy(q.data, data, size);
+            if (direct) job_push(d, q);
+            else d->queue[(d->qhead + d->qn++) % QUEUED] = q;
+            if (id) *id = d->seq;
+        }
+        int waiting = d->qn;
+        plat_mutex_unlock(&lock);
+        TRACE("submit %zu bytes pts %lld%s: %s (%d queued)", size, (long long)pts, end ? " end" : "",
+              direct ? "to the decoder thread" : queued ? "queued for the next reserved buffer" : "not ready", waiting);
+        ret_x(c, direct || queued ? 0 : R_NOT_READY);
+        return;
+    }
     Slot *s = d && !d->qn ? oldest_wait(d) : NULL;
     if (!s) {
         int queued = d && d->qn < QUEUED;
@@ -406,7 +558,8 @@ static void ov_vp9_acquire(Cpu *c) {
         *index = (uint32_t)got;
         if (fence) *fence = FENCE_TAG | (uint32_t)(d - decs) << 8 | (uint32_t)got;
         Slot *w;
-        while (d->qn && (w = oldest_wait(d)) && n <= SLOTS * WAITERS - WAITERS) {
+        if (codec_async() && worker > 0) feed(d);   // the worker decodes them and signals the fences
+        else while (d->qn && (w = oldest_wait(d)) && n <= SLOTS * WAITERS - WAITERS) {
             Packet q = d->queue[d->qhead];
             d->qhead = (d->qhead + 1) % QUEUED, d->qn--;
             n += decode_into(d, w, q.data, q.size, q.pts, q.end, wake + n);
@@ -565,7 +718,9 @@ static void av1_init(Cpu *c, uint64_t key, unsigned w, unsigned h) {
     Dec *d = dec_of(key);
     Dav1dSettings set;
     dav1d_default_settings(&set);
-    set.n_threads = 4;
+    // OOT_AV1_THREADS=<n>: dav1d threads (default 4; 0 lets dav1d pick from the core count).
+    const char *th = getenv("OOT_AV1_THREADS");
+    set.n_threads = th ? atoi(th) : 4;
     set.max_frame_delay = 1;   // a picture per packet: the player waits for each one
     if (d && dav1d_open(&d->av1, &set) < 0) d->av1 = NULL;
     plat_mutex_unlock(&lock);
@@ -576,6 +731,7 @@ static void ov_av1_init_remote(Cpu *c) { av1_init(c, arg_x(c, 0), arg_x(c, 2) & 
 static void ov_av1_flush(Cpu *c) {
     plat_mutex_lock(&lock);
     Dec *d = dec_of(arg_x(c, 0));
+    if (d) quiesce(d);   // the worker may be inside dav1d for this decoder
     if (d && d->av1) dav1d_flush(d->av1);
     plat_mutex_unlock(&lock);
     ov_vp9_flush(c);
