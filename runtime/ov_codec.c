@@ -629,6 +629,11 @@ static void ov_read_nv12(Cpu *c) {
         n = uw < uvp ? uw : uvp;
         for (uint32_t r = 0; r < uh && luv && r * uvp + n <= uvs; r++)
             memcpy(luv + r * uvp, uv + (size_t)(uy + r) * 2 * cw(s->w) + ux, n);
+    } else {   // no picture in this pool yet: black (NV12 zeros are green, which the movie showed before its first picture)
+        size_t lw = w < yp ? w : yp, cwid = 2 * (size_t)((w + 1) / 2);
+        if (cwid > uvp) cwid = uvp;
+        for (uint32_t r = 0; r < h && ly && r * yp + lw <= ys; r++) memset(ly + r * yp, 16, lw);
+        for (uint32_t r = 0; r < (h + 1u) / 2 && luv && r * uvp + cwid <= uvs; r++) memset(luv + r * uvp, 128, cwid);
     }
     int64_t pts = s ? s->pts : -1;
     plat_mutex_unlock(&lock);
