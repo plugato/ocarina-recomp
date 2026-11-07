@@ -1,0 +1,40 @@
+--- a/src/Ryujinx.Graphics.Shader/Translation/Transforms/ShufflePass.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Transforms/ShufflePass.cs
+@@ -30,14 +30,35 @@
+                 return node;
+             }
+ 
+-            int functionId = context.Hfm.GetOrCreateShuffleFunctionId(functionName, context.GpuAccessor.QueryHostSubgroupSize());
+-
+             Operand result = operation.GetDest(0);
+             Operand valid = operation.GetDest(1);
+             Operand value = operation.GetSource(0);
+             Operand index = operation.GetSource(1);
+             Operand mask = operation.GetSource(2);
+ 
++            // OoT (2026-11-06): SHFL.IDX with the plain mask (clamp 31, no segment) on a 32-lane subgroup is the
++            // subgroup shuffle itself: the helper call, with its four pointer arguments copied to variables, cost
++            // about fifteen SPIR-V instructions per shuffle, and sm86_lower.c's tensor-core emulation makes tens
++            // of thousands of them per kernel (a 22 MB SPIR-V the driver compiled for minutes). The lane index is
++            // masked to the subgroup, which is what the hardware's clamp does for every index the emulation makes.
++            if (functionName == HelperFunctionName.Shuffle &&
++                mask.Type == OperandType.Constant && (mask.Value & 0x1f) == 0x1f && ((mask.Value >> 8) & 0x1f) == 0 &&
++                context.GpuAccessor.QueryHostSubgroupSize() == 32)
++            {
++                operation.Dest = null;
++
++                Operand lane = Local();
++                LinkedListNode<INode> andNode = node.List.AddBefore(node, new Operation(Instruction.BitwiseAnd, lane, [index, Const(31)]));
++                node.List.AddBefore(node, new Operation(Instruction.Shuffle, 0, result, [value, lane]));
++                node.List.AddBefore(node, new Operation(Instruction.Copy, valid, [Const(-1)]));
++
++                Utils.DeleteNode(node, operation);
++
++                return andNode;
++            }
++
++            int functionId = context.Hfm.GetOrCreateShuffleFunctionId(functionName, context.GpuAccessor.QueryHostSubgroupSize());
++
+             operation.Dest = null;
+ 
+             Operand[] callArgs = [Const(functionId), value, index, mask, valid];
