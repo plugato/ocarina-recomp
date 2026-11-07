@@ -56,12 +56,24 @@ extern const char rt_port_version[];
 }
 
 // Roboto Medium (Apache-2.0, ui/fonts/LICENSE-Roboto.txt) with Latin and Cyrillic glyphs.
+// #embed needs clang 19; older clang (Ubuntu 24.04's 18) takes the bytes with the assembler's .incbin, which finds the
+// file through the -I runtime the build passes.
+#if defined(__clang_major__) && __clang_major__ >= 19
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wc23-extensions"   // #embed in C++
-static const unsigned char roboto_ttf[] = {
+static const unsigned char roboto_ttf_data[] = {
 #embed "fonts/Roboto-Medium.ttf"
 };
 #pragma clang diagnostic pop
+static const unsigned char *const roboto_ttf = roboto_ttf_data;
+static const size_t roboto_ttf_size = sizeof roboto_ttf_data;
+#else
+extern "C" const unsigned char menu_roboto_ttf[], menu_roboto_ttf_end[];
+__asm__(".section .rodata\n.balign 16\nmenu_roboto_ttf:\n.incbin \"ui/fonts/Roboto-Medium.ttf\"\nmenu_roboto_ttf_end:\n"
+        ".byte 0\n.previous\n");
+static const unsigned char *const roboto_ttf = menu_roboto_ttf;
+static const size_t roboto_ttf_size = (size_t)(menu_roboto_ttf_end - menu_roboto_ttf);
+#endif
 
 // ---- open state, any thread
 static std::atomic<int> g_open;     // the menu is open
@@ -301,7 +313,7 @@ static int font_usable(const uint8_t *d, uint64_t n) {
 }
 
 extern "C" int menu_font_check(void) {
-    uint64_t n = sizeof roboto_ttf;
+    uint64_t n = roboto_ttf_size;
     uint8_t *bad = (uint8_t *)malloc(n);
     if (!bad) return 0;
     memcpy(bad, roboto_ttf, n);
@@ -322,7 +334,7 @@ static int fonts_up(float scale) {
     fa->Clear();
     ImFontConfig fc;
     fc.FontDataOwnedByAtlas = false;
-    fa->AddFontFromMemoryTTF((void *)roboto_ttf, (int)sizeof roboto_ttf, 26.0f * scale, &fc, kRanges);
+    fa->AddFontFromMemoryTTF((void *)roboto_ttf, (int)roboto_ttf_size, 26.0f * scale, &fc, kRanges);
     uint8_t *data[N] = {};
     ImVector<ImWchar> ranges[N];
     int merged = 0;
