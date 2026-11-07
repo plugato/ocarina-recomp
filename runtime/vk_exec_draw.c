@@ -46,6 +46,13 @@ static const uint32_t (*c0_push)[NVN2_ROOT_WORDS];
 #define NVN_STAGE_FS 1
 #define NVN_STAGE_GS 2
 #define NVN_STAGE_CS 5
+
+// A debug variable read once: the first call caches getenv's answer, so a draw or dispatch never pays for a getenv
+// (a scan of the whole environment block) per call. Debug switches are set before start and never change.
+#define ENV_ONCE(name) ({ static const char *env_v_; static int env_got_; \
+    if (!__atomic_load_n(&env_got_, __ATOMIC_ACQUIRE)) { env_v_ = getenv(name); __atomic_store_n(&env_got_, 1, __ATOMIC_RELEASE); } \
+    env_v_; })
+
 static uint8_t geometry_input;                              // normalized actual draw primitive; zero outside opt-in GS
 #define ONESHOT_WAIT_MS 1000u   /* LOCAL TEST (Ocarina): was 30000; a pipeline with guarded candidates compiles for a minute, and the game froze that long */ //   // prepare_draw: how long a one-shot draw waits for its pipeline before it is skipped
 
@@ -1047,12 +1054,46 @@ static uint64_t dyn_readable(uint64_t addr, uint64_t want) {
     return mi.avail < want ? mi.avail : want;
 }
 
+// The addresses dyn_add took in the current dyn_collect call, as an open-addressing set: a duplicate costs one probe
+// instead of a scan of everything found so far (up to 2048 candidates, so the scan was quadratic). A generation stamp
+// empties the set between calls without clearing it. Used from the replay thread only, like dyn_lists and gcache.
+#define DYN_SET_BITS 12
+#define DYN_SET (1u << DYN_SET_BITS)   // twice the largest candidate count: probes stay short
+static struct { uint64_t v; uint32_t gen; } dyn_set[DYN_SET];
+static uint32_t dyn_gen;
+
+static void dyn_set_reset(void) {
+    if (++dyn_gen == 0) {   // the stamp wrapped: old entries could match it again
+        memset(dyn_set, 0, sizeof dyn_set);
+        dyn_gen = 1;
+    }
+}
+
 static int dyn_add(uint64_t *found, int n, int cap, uint64_t v) {
+    if (n >= cap || v < 0x100000000ull || v >= 0x10000000000ull || (v & 7)) return n;
+    uint32_t h = (uint32_t)(((v >> 3) * 0x9E3779B97F4A7C15ull) >> (64 - DYN_SET_BITS));
+    while (dyn_set[h].gen == dyn_gen) {
+        if (dyn_set[h].v == v) return n;
+        h = (h + 1) & (DYN_SET - 1);
+    }
+    // Checked after the set: a value already taken passed this test, so the found list is the same as before.
     VkMemSpan ms;
-    if (n >= cap || v < 0x100000000ull || v >= 0x10000000000ull || (v & 7) || !vk_mem_resolve(v, 8, &ms) || ms.avail < 8) return n;
-    for (int i = 0; i < n; i++) if (found[i] == v) return n;
+    if (!vk_mem_resolve(v, 8, &ms) || ms.avail < 8) return n;
+    dyn_set[h].v = v, dyn_set[h].gen = dyn_gen;
     found[n] = v;
     return n + 1;
+}
+
+// Graphics stages: the lists already built in this frame, keyed by the stage's bound storage buffers. A pass that
+// alternates between a few material buffer sets used to rebuild the list (reading up to 64 KiB of each of 16 buffers)
+// on every switch, since only the last set was kept. A list stays valid for the frame, as with the single entry
+// before. OOT_DYN_CACHE=0 rebuilds the list on every draw (to rule the cache out when a frame looks wrong).
+#define DYN_GCACHE 8
+static uint64_t dyn_ssbo_hash(const p_bind_buf ssbo[16]) {
+    const uint64_t *w = (const uint64_t *)(const void *)ssbo;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < 16 * sizeof(p_bind_buf) / 8; i++) h = (h ^ w[i]) * 0x100000001b3ull;
+    return h ^ (h >> 29);
 }
 
 static void dyn_collect(VkExec *ex, const VkPipeInfo *info, int st) {
@@ -1070,13 +1111,25 @@ static void dyn_collect(VkExec *ex, const VkPipeInfo *info, int st) {
     // LOCAL TEST (Ocarina): graphics: the pointer tables are the scene's and long (a run-time index picks the entry), so they are read
     // further, once per frame and set of bound buffers. ponytail: the first 64 KiB of each; the raw pool table (seedds/nxnative
     // TryGenerateRawStorageOp) needs no list at all.
-    static struct { p_bind_buf ssbo[16]; uint64_t frame; } gcache[6];
+    static struct { p_bind_buf ssbo[16]; uint64_t frame, hash; typeof(dyn_lists[0]) list; } gcache[6][DYN_GCACHE];
+    static uint8_t gcache_next[6];
     uint64_t gframe = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-    if (st != NVN_STAGE_CS && wanted && gcache[st].frame == gframe && !memcmp(gcache[st].ssbo, ex->ssbo[st], sizeof gcache[st].ssbo)) return;
-    if (st != NVN_STAGE_CS) gcache[st].frame = gframe, memcpy(gcache[st].ssbo, ex->ssbo[st], sizeof gcache[st].ssbo);
+    int gcached = st != NVN_STAGE_CS && wanted && !(ENV_ONCE("OOT_DYN_CACHE") && *ENV_ONCE("OOT_DYN_CACHE") == '0');
+    uint64_t ghash = gcached ? dyn_ssbo_hash(ex->ssbo[st]) : 0;
+    if (gcached)
+        for (int c = 0; c < DYN_GCACHE; c++) {
+            typeof(gcache[0][0]) *g = &gcache[st][c];
+            if (g->frame != gframe + 1 || g->hash != ghash || memcmp(g->ssbo, ex->ssbo[st], sizeof g->ssbo)) continue;
+            if (memcmp(g->list, *dyn_now, sizeof g->list)) {
+                memcpy(*dyn_now, g->list, sizeof g->list);
+                memset(B.c0_valid, 0, sizeof B.c0_valid);
+            }
+            return;
+        }
     typeof(dyn_lists[0]) now;
     memset(now, 0, sizeof now);
     if (wanted) {
+        dyn_set_reset();
         static uint64_t cs_scan;   // OOT_CS_SCAN=<bytes> of each compute storage buffer read for pointers (0x100)
         if (!cs_scan) { const char *e = getenv("OOT_CS_SCAN"); cs_scan = e ? strtoull(e, NULL, 0) : 0x100; }
         enum { CAP = 2048 };
@@ -1148,6 +1201,12 @@ static void dyn_collect(VkExec *ex, const VkPipeInfo *info, int st) {
                            (unsigned long long)u->size, (unsigned long long)len, (unsigned long long)ptrs, (unsigned long long)miss, (unsigned long long)first, (unsigned long long)firsto);
                 }
         }
+    }
+    if (gcached) {   // frame + 1: a zeroed entry never matches frame 0
+        typeof(gcache[0][0]) *g = &gcache[st][gcache_next[st]++ % DYN_GCACHE];
+        g->frame = gframe + 1, g->hash = ghash;
+        memcpy(g->ssbo, ex->ssbo[st], sizeof g->ssbo);
+        memcpy(g->list, now, sizeof now);
     }
     if (memcmp(now, *dyn_now, sizeof now)) {
         memcpy(*dyn_now, now, sizeof now);
@@ -2858,7 +2917,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         static int skip_w = -1, skip_h;   // OOT_SKIP_PASS=<w>x<h>: no draws in passes of that size
         if (skip_w < 0) { const char *e = getenv("OOT_SKIP_PASS"); skip_w = 0; if (e) sscanf(e, "%dx%d", &skip_w, &skip_h); }
         if (skip_w && (int)ex->pass_w == skip_w && (int)ex->pass_h == skip_h) return 0;
-        if (ex->pass_w == 256 && ex->pass_h == 144 && getenv("OOT_COUNT_256")) {
+        if (ex->pass_w == 256 && ex->pass_h == 144 && ENV_ONCE("OOT_COUNT_256")) {
             static int told;
             if (told++ < 200) rt_log("256-draw prog %llu count %d frame %llu", ex->prog ? (unsigned long long)ex->prog->serial : 0ull, (int)count, (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
         }
@@ -2946,7 +3005,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         mesh_task_draw = 1;
         B.c0_valid[0] = 0;
     }
-    if (ts && getenv("OOT_NO_TASK")) return 0;   // LOCAL TEST (Ocarina)
+    if (ts && ENV_ONCE("OOT_NO_TASK")) return 0;   // LOCAL TEST (Ocarina)
     if (vs && gfx_shader_is_mesh(vs)) mesh_task_draw = 1;
     if (!has_vs) return warn_once(W_NO_VS, "a draw with a program that has no vertex stage is skipped"), 0;
     if (vs && gfx_shader_is_mesh(vs) != draw_is_mesh) return draw_why(ex, "mesh program in a vertex draw, or the reverse"), 0;
@@ -3013,7 +3072,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
             static char line[97];
             static int nl_;
             const p_bind_buf *u6 = &ex->ubo[NVN_STAGE_FS][3];
-            if (getenv("OOT_FLASH_LOG") && mat_ && f_ != lastf && u6->addr && u6->size >= 0x270) {
+            if (ENV_ONCE("OOT_FLASH_LOG") && mat_ && f_ != lastf && u6->addr && u6->size >= 0x270) {
                 lastf = f_;
                 const float *q = (const float *)(uintptr_t)(u6->addr + 38 * 16);
                 line[nl_++] = q[1] < 0 ? '-' : '+';
@@ -3511,8 +3570,8 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
     {   // LOCAL TEST (Ocarina)
         extern void vk_dump_buf_follow(uint64_t);
         uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-        if (vk_dump_armed && getenv("OOT_FOLLOW_MESH") && f == strtoull(getenv("OOT_FOLLOW_MESH"), NULL, 0) && ex->prog &&
-            ex->prog->serial == strtoull(getenv("OOT_FOLLOW_PROG"), NULL, 0)) vk_dump_buf_follow(d->ind);
+        if (vk_dump_armed && ENV_ONCE("OOT_FOLLOW_MESH") && f == strtoull(ENV_ONCE("OOT_FOLLOW_MESH"), NULL, 0) && ex->prog &&
+            ENV_ONCE("OOT_FOLLOW_PROG") && ex->prog->serial == strtoull(ENV_ONCE("OOT_FOLLOW_PROG"), NULL, 0)) vk_dump_buf_follow(d->ind);
     }
     {   // LOCAL TEST (Ocarina): OOT_MESH_ALLOW=<lo>-<hi>: indirect mesh draws of those program serials only; each serial logged once
         static long lo = -2, hi;
@@ -3557,7 +3616,7 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
     VK_MEM_USE(ip);   // the copy reads the same buffer the GPU's culling wrote (the mirror, when there is one)
     static int mesh_old = -1;   // LOCAL TEST (Ocarina): OOT_MESH_OLD=1: the record as it is
     if (mesh_old < 0) mesh_old = getenv("OOT_MESH_OLD") != NULL;
-    if (!getenv("OOT_MESH_DIRECT") && !mesh_old && !mesh_args(ex, &ip, &mesh_off)) {
+    if (!ENV_ONCE("OOT_MESH_DIRECT") && !mesh_old && !mesh_args(ex, &ip, &mesh_off)) {
         static int told;
         if (!told++) rt_log("vk: indirect mesh draw dropped: mesh_args failed");
         return;
@@ -3855,7 +3914,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     {   // LOCAL TEST (Ocarina)
         extern void vk_dump_buf_follow(uint64_t);
         uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-        if (vk_dump_armed && getenv("OOT_FOLLOW_IND") && f == strtoull(getenv("OOT_FOLLOW_IND"), NULL, 0)) vk_dump_buf_follow(d->ind);
+        if (vk_dump_armed && ENV_ONCE("OOT_FOLLOW_IND") && f == strtoull(ENV_ONCE("OOT_FOLLOW_IND"), NULL, 0)) vk_dump_buf_follow(d->ind);
     }
     if (!vk_mem_resolve(d->ind, sizeof(VkDispatchIndirectCommand), &ip) || ip.offset % 4)
         return warn_once(W_INDIRECT, "indirect dispatch arguments at %#llx are not backed or not aligned: skipped", (unsigned long long)d->ind);
@@ -3919,7 +3978,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
         
         {
             extern void vk_dump_buf_follow(uint64_t);
-            if (vk_dump_armed && getenv("OOT_FOLLOW_P1") && __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) == strtoull(getenv("OOT_FOLLOW_P1"), NULL, 0)) vk_dump_buf_follow(a90);
+            if (vk_dump_armed && ENV_ONCE("OOT_FOLLOW_P1") && __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) == strtoull(ENV_ONCE("OOT_FOLLOW_P1"), NULL, 0)) vk_dump_buf_follow(a90);
         }
         rt_log("vk: pass-1 family: layout ubos %u ssbos %u; c0+50 %#llx flag %u (cpu %d); c0+60 %#llx count %u (cpu %d); c0+70 %#llx c0+80 %#llx c0+90 %#llx; args %#llx", c0_lay->ubos, c0_lay->ssbos,
                (unsigned long long)a50, c5 ? *(uint32_t *)(uintptr_t)(a50 + 448520) : 0, c5, (unsigned long long)a60, c6 ? *(uint32_t *)(uintptr_t)(a60 + 12) : 0, c6,
