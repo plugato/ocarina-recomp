@@ -173,11 +173,29 @@ static char *norm_key(char *key) {
     return strncmp(key, PREFIX, PREFIX_LEN) ? key : key + PREFIX_LEN;
 }
 
+// Keys that name a program or library to run (XLATE, RDOC_DLL) or a place to write files (the *_OUT and *_DIR ones).
+// They come from the environment only: an ini copied from a forum cannot make the game start an .exe, load a DLL or
+// write outside its folder. The environment is set by the player or the launcher, who already run code as the user.
+static const char *const env_only[] = {
+    "XLATE", "RDOC_DLL", "CRIT_OUT", "DUMP_DIR", "RDOC_DIR", "FLIGHT_DIR", "PROFILE_DIR", "SHOTS_DIR",
+    "MENU_TEST_DIR", "ROMFS_PROOF_DIR",
+};
+
+static int is_env_only(const char *key) {
+    for (size_t i = 0; i < sizeof env_only / sizeof *env_only; i++)
+        if (!strcmp(env_only[i], key)) return 1;
+    return 0;
+}
+
 static void add(char *key, char *value, int line) {
     key = norm_key(key);
     size_t vl = strlen(value);
     if (vl >= 2 && value[0] == '"' && value[vl - 1] == '"') value[vl - 1] = 0, value++;
     if (!*key) return;
+    if (is_env_only(key)) {
+        rt_log("cfg: totk.ini line %d: '%s' is ignored in the file; set TOTK_%s in the environment", line, key, key);
+        return;
+    }
     if (!is_known(key)) rt_log("cfg: totk.ini line %d: unknown key '%s'", line, key);
     if (!*value) return;   // "key =" leaves the setting at its default
     for (int i = 0; i < n_entries; i++)

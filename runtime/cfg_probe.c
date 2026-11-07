@@ -35,6 +35,9 @@ int probe_cfg(void) {
         "trace = b\r\n"
         "no_such_setting = 1\r\n"
         "no equals sign\r\n"
+        "xlate = C:\\evil.exe\r\n"
+        "TOTK_RDOC_DLL = evil.dll\r\n"
+        "dump_dir = C:\\Windows\r\n"
         "last = no newline at the end";
     plat_setenv("TOTK_LOCALE", NULL);
     plat_setenv("TOTK_FPS60", NULL);
@@ -49,6 +52,15 @@ int probe_cfg(void) {
     CHECK(cfg_get("TOTK_CLOTH_REALTIME") == NULL, "absent key is NULL");
     CHECK(cfg_get("TOTK_comment") == NULL, "comment is not a key");
     CHECK(EQ(cfg_get("TOTK_NO_SUCH_SETTING"), "1"), "unknown key is still readable");
+    plat_setenv("TOTK_XLATE", NULL);
+    plat_setenv("TOTK_RDOC_DLL", NULL);
+    plat_setenv("TOTK_DUMP_DIR", NULL);
+    CHECK(cfg_get("TOTK_XLATE") == NULL, "the file cannot name the translator to run");
+    CHECK(cfg_get("TOTK_RDOC_DLL") == NULL, "the file cannot name a library to load");
+    CHECK(cfg_get("TOTK_DUMP_DIR") == NULL, "the file cannot name a folder to write to");
+    plat_setenv("TOTK_XLATE", "x.exe");
+    CHECK(EQ(cfg_get("TOTK_XLATE"), "x.exe"), "the environment still sets the translator");
+    plat_setenv("TOTK_XLATE", NULL);
     plat_setenv("TOTK_FPS60", "1");
     CHECK(EQ(cfg_get("TOTK_FPS60"), "1"), "environment overrides the file");
     plat_setenv("TOTK_FPS60", NULL);
