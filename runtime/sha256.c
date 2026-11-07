@@ -6,6 +6,7 @@
 #include <string.h>
 
 #if defined(__x86_64__)
+#include <cpuid.h>
 #include <immintrin.h>
 #endif
 
@@ -78,7 +79,11 @@ __attribute__((target("sha,sse4.1"))) static void blocks_ni(uint32_t h[8], const
 static void blocks(uint32_t h[8], const uint8_t *p, size_t n) {
 #if defined(__x86_64__)
     static int ni = -1;
-    if (ni < 0) ni = __builtin_cpu_supports("sha") && __builtin_cpu_supports("sse4.1");
+    if (ni < 0) {   // cpuid directly: clang 18 rejects "sha" in __builtin_cpu_supports
+        unsigned a, b, c, d;
+        int sse41 = __get_cpuid(1, &a, &b, &c, &d) && (c & bit_SSE4_1);
+        ni = sse41 && __get_cpuid_count(7, 0, &a, &b, &c, &d) && (b & bit_SHA);
+    }
     if (ni) return blocks_ni(h, p, n);
 #endif
     blocks_c(h, p, n);
