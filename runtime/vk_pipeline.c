@@ -632,6 +632,8 @@ static VkFormat target_format(int nvn_format, int *depth, int *stencil) {
     if (!nvn_format || !tex_vk_format(nvn_format, &t)) return VK_FORMAT_UNDEFINED;
     if (depth) *depth = t.depth;
     if (stencil) *stencil = t.stencil;
+    if (nvn_format == 0x40 && t.vk == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && tex_rgb9e5_stand_in())
+        return tex_rgb9e5_target();   // the render target's view format (vk_exec.c resolve_target)
     return t.vk;
 }
 

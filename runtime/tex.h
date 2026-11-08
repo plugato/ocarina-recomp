@@ -66,3 +66,8 @@ typedef struct TexVkFormat {
 int tex_vk_format(int nvn_format, TexVkFormat *out);
 // 1 when vk_ctx()->phys reports every bit of f->need for f->vk in optimal tiling. Needs vk_init().
 int tex_vk_format_supported(const TexVkFormat *f);
+// 1 when NVN's RGB9E5 is a B10G11R11 image drawn through an R32_SFLOAT view (the device cannot render RGB9E5)
+int tex_rgb9e5_stand_in(void);
+VkFormat tex_rgb9e5_target(void);
+void tex_rgb9e5_note(uint64_t addr);   // a stand-in target drawn at this storage address
+int tex_rgb9e5_at(uint64_t addr);       // 1 when a stand-in target was drawn there   // the format draws into that stand-in use (view and pipeline)

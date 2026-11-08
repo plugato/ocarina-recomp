@@ -623,6 +623,8 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
     }
     uint32_t swz = (uint32_t)sw[0] | (uint32_t)sw[1] << 8 | (uint32_t)sw[2] << 16 | (uint32_t)sw[3] << 24;
     VkFormat view_format = storage ? vk_srgb_store_format(img->format) : img->format;
+    if (!storage && img->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && tex_rgb9e5_at(img->addr))
+        view_format = VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;   // bytes the RGB9E5 stand-in drew (vk_formats.c)
     // LOCAL TEST (Ocarina): a game can store through a view in another format of the same size (Ocarina's tone map packs
     // r11g11b10f by hand and stores it as R32UI). The translator types every image as float and passes the packed bits in
     // a float, so an integer view is taken as R32F: the bits arrive as they are. ponytail: only 32-bit texels.

@@ -3,7 +3,9 @@
 // Differences from LAS: the table is indexed by the NVNformat values of nvn.h and covers all of them, ASTC decodes to
 // RGBA8 unless the device samples it (vk_astc.c, TOTK_ASTC), D24S8 is always D32S8 (no probing: the RX 9070 lacks
 // it), 3-component formats expand to 4 components, and formats with no Vulkan equivalent are reported with a reason.
+#include <stdlib.h>
 #include <string.h>
+#include "host.h"
 #include "tex.h"
 
 #define S VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
@@ -103,6 +105,50 @@ static const struct { uint8_t bw, bh; VkFormat unorm, srgb; } astc[14] = {
     {12, 12, VK_FORMAT_ASTC_12x12_UNORM_BLOCK, VK_FORMAT_ASTC_12x12_SRGB_BLOCK},
 };
 
+// RGB9E5 (NVN 0x40): Vulkan makes rendering into it optional and NVIDIA desktop GPUs lack it (RTX 3070, Linux driver).
+// Ocarina's tone map (fragment shader 09a0b957b33414d3) draws into one at the scene size and puts the packed RGB9E5 bits
+// in its red output; the upscaler then reads the same bytes through an r11g11b10f texture. Left out, every 3D frame was
+// black. Here the image is B10G11R11, the same format as that texture, so both have one layout in memory (two VkImages
+// of different formats on the same memory did not agree on NVIDIA), and draws go through an R32_SFLOAT view, which
+// stores the 32 bits as they are (B10G11R11 itself converted them: the scene turned red). OOT_RGB9E5_R32=0: RGB9E5.
+int tex_rgb9e5_stand_in(void) {
+    static int sub = -1;
+    if (sub < 0) {
+        if (!vk_ctx()) return 0;
+        VkFormatProperties p;
+        vkGetPhysicalDeviceFormatProperties(vk_ctx()->phys, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, &p);
+        const char *e = getenv("OOT_RGB9E5_R32");
+        sub = !(p.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) && !(e && *e == '0');
+    }
+    return sub;
+}
+
+// The format draws into an RGB9E5 stand-in use, for the render target's view and the pipeline alike (both must agree, or
+// the driver converts the output for one format and stores it as the other). OOT_RGB9E5_VIEW=u: R32_UINT.
+VkFormat tex_rgb9e5_target(void) {
+    const char *e = getenv("OOT_RGB9E5_VIEW");
+    return e && *e == 'u' ? VK_FORMAT_R32_UINT : VK_FORMAT_R32_SFLOAT;
+}
+
+// Storage addresses drawn as RGB9E5 through the stand-in: their bytes hold RGB9E5 texels, so a B10G11R11 texture over the
+// same storage (the upscaler's r11g11b10f descriptor) is sampled through an E5B9G9R9 view, which decodes them as the
+// Switch does. A small set: the game draws one such target per scene size.
+static uint64_t e5_addr[16];
+static volatile int e5_n;
+void tex_rgb9e5_note(uint64_t addr) {
+    int n = __atomic_load_n(&e5_n, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) if (e5_addr[i] == addr) return;
+    if (n == 16) return;
+    e5_addr[n] = addr;
+    __atomic_store_n(&e5_n, n + 1, __ATOMIC_RELEASE);
+    rt_log("vk: RGB9E5 target at %#llx: textures over it are sampled as RGB9E5", (unsigned long long)addr);
+}
+int tex_rgb9e5_at(uint64_t addr) {
+    int n = __atomic_load_n(&e5_n, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) if (e5_addr[i] == addr) return 1;
+    return 0;
+}
+
 int tex_vk_format(int nvn_format, TexVkFormat *o) {
     memset(o, 0, sizeof *o);
     o->vk = o->ideal = VK_FORMAT_UNDEFINED;
@@ -152,6 +198,10 @@ int tex_vk_format(int nvn_format, TexVkFormat *o) {
         memcpy(o->chan, r->alt_chan, sizeof o->chan);
         o->note = "16-bit packed format: the device lacks the exact Vulkan format, a mandatory one stands in with the "
                   "components reordered by the view swizzle";
+    }
+    if (f == 0x40 && tex_rgb9e5_stand_in()) {
+        o->vk = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+        o->note = "RGB9E5 is not renderable here: B10G11R11 holds its 32 bits, drawn through an R32_SFLOAT view";
     }
     if (f == 0x31) o->stencil = 1;
     if (f >= 0x32 && f <= 0x34) o->depth = 1;

@@ -352,6 +352,8 @@ static void resolve_target(const tex_t *t, const view_t *v, int has_v, int depth
         else warn_once(W_VIEW_FORMAT, "render target view format %#x of a format %#x texture: texture format used",
                        v->format, t->d.format);
     }
+    if (!depth_slot && nvn_fmt == 0x40 && fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && tex_rgb9e5_stand_in())
+        fmt = tex_rgb9e5_target(), tex_rgb9e5_note(img->addr);   // the 32 bits the tone map packs pass unchanged (vk_formats.c)
     o->image = img->image;
     o->img = img;
     o->format = fmt;
