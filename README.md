@@ -60,7 +60,8 @@ powershell -ExecutionPolicy Bypass -File .\compilar.ps1 -Jogo "C:\caminho\seu-jo
 **3. Totalmente à mão:** siga o **[passo a passo para compilar](docs/compilar-manual.md)**.
 
 **No Linux:** o `compilar.sh` faz os mesmos passos e o `jogar/jogar-ocarina.sh` abre o jogo. Os pacotes e o estado do
-port estão em [docs/building.md](docs/building.md#linux-in-progress).
+port estão em [docs/building.md](docs/building.md#linux-in-progress). Desempenho e imagem com NVIDIA no Linux:
+[docs/desempenho-linux-nvidia.md](docs/desempenho-linux-nvidia.md).
 
 ```sh
 git clone https://github.com/sostenesfreitas/ocarina-recomp
