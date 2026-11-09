@@ -171,6 +171,16 @@ Lowered *lower(const uint8_t *control, const uint8_t *code) {
                                   static_cast<uint16_t>(type == 3 ? payload_words : 0)};
         std::memcpy(out->control.data() + kC0Layout, "DKM1", 4);
         std::memcpy(out->control.data() + kC0Layout + 4, mesh, sizeof mesh);
+        {   // The per-primitive output map: the 128-byte program header after the code (code_len bytes in), the same layout as an SPH.
+            // Its system byte (0x35) and 16 generic nibble bytes (0x36) go after the mesh fields; all zero without per-primitive outputs.
+            uint32_t cl = 0;
+            std::memcpy(&cl, control + 0x38, 4);
+            uint32_t pw0 = 0;
+            std::memcpy(&pw0, code + cl, 4);
+            if (pw0) {
+                std::memcpy(out->control.data() + kC0Layout + 12, code + cl + 0x35, 17);
+            }
+        }
     }
     if (!gfx) {
         std::memcpy(out->control.data() + 0x748, control + 0x58, 12);   // local size (NVN 2 control +0x58)

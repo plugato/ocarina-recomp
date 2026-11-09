@@ -25,11 +25,13 @@ static struct {
     uint8_t *out;
     uint32_t width, height, bw, bh, bx, by, chunk;
     bool srgb;
+    bool bc3;                                // bc3_encode_mt: blocks is RGBA8, out BC3, bx/by count 4x4 blocks
     volatile int32_t next;                      // first block row not yet claimed
 } P = {PLAT_ONCE_INIT, .lock = PLAT_MUTEX_INIT, .work = PLAT_COND_INIT, .done = PLAT_COND_INIT};
 
 // Block rows [j0, j1) of the current image, as astc_decode_ldr's loop does them.
 static void decode_rows(uint32_t j0, uint32_t j1) {
+    if (P.bc3) { bc3_encode_rows(P.blocks, P.width, P.height, j0, j1, P.out); return; }
     uint32_t bw = P.bw, bh = P.bh, width = P.width, height = P.height;
     uint8_t tmp[12 * 12 * 4];
     for (uint32_t j = j0; j < j1; j++) {
@@ -98,8 +100,35 @@ void astc_decode_ldr_mt(const uint8_t *blocks, uint32_t width, uint32_t height, 
     }
     plat_mutex_lock(&P.lock);
     P.blocks = blocks, P.out = rgba_out, P.width = width, P.height = height, P.bw = bw, P.bh = bh, P.bx = bx, P.by = by;
-    P.srgb = srgb;
+    P.srgb = srgb, P.bc3 = false;
     uint32_t parts = (uint32_t)(P.threads + 1) * 4;   // a few chunks per thread evens out uneven blocks
+    P.chunk = by / parts ? by / parts : 1;
+    P.next = 0;
+    P.active = P.threads;
+    P.gen++;
+    plat_cond_broadcast(&P.work);
+    plat_mutex_unlock(&P.lock);
+    claim_rows();
+    plat_mutex_lock(&P.lock);
+    while (P.active) plat_cond_wait(&P.done, &P.lock);
+    plat_mutex_unlock(&P.lock);
+    plat_mutex_unlock(&P.busy);
+}
+
+void bc3_encode_mt(const uint8_t *rgba, uint32_t width, uint32_t height, uint8_t *out) {
+    uint32_t bx = (width + 3) / 4, by = (height + 3) / 4;
+    if ((uint64_t)bx * by < MT_MIN_BLOCKS || by < 2) {
+        bc3_encode(rgba, width, height, out);
+        return;
+    }
+    plat_once(&P.once, pool_init, NULL);
+    if (!P.threads || !plat_mutex_trylock(&P.busy)) {
+        bc3_encode(rgba, width, height, out);
+        return;
+    }
+    plat_mutex_lock(&P.lock);
+    P.blocks = rgba, P.out = out, P.width = width, P.height = height, P.bx = bx, P.by = by, P.bc3 = true;
+    uint32_t parts = (uint32_t)(P.threads + 1) * 4;
     P.chunk = by / parts ? by / parts : 1;
     P.next = 0;
     P.active = P.threads;

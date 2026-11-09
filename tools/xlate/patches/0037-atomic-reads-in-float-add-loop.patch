@@ -1,0 +1,14 @@
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMemory.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMemory.cs
+@@ -240,7 +240,10 @@ namespace Ryujinx.Graphics.Shader.Instructions
+             {
+                 Operand retry = Label();
+                 context.MarkLabel(retry);
+-                Operand old = context.Load(storageKind, e0, e1);
++                // Each try reads the word atomically (OR 0): a plain load may be served from a cache the atomics
++                // bypass, or hoisted out of the loop, and AMD drivers then spin forever on a stale value (device lost,
++                // nemyu 4fe22c86). The loop cannot carry the CAS result instead: IR locals are assigned once.
++                Operand old = context.AtomicOr(storageKind, e0, e1, Const(0));
+                 Operand seen = context.AtomicCompareAndSwap(storageKind, e0, e1, old, context.FPAdd(old, value));
+                 context.BranchIfFalse(retry, context.ICompareEqual(seen, old));
+                 return old;

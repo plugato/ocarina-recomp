@@ -1,0 +1,50 @@
+#version 450
+// Frame interpolation (vk_framegen.c): the camera's motion per 16x16 block from the scene's depth and the camera of
+// this frame and the last (oot_motion.c), checked against the picture. Each block keeps the camera's vector where it
+// explains the block's luma at least as well as the block-matching one (the static world, the sky), else the
+// block-matching one (Link, moving foliage, the HUD the camera does not move).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D la;      // last frame's quarter-size luma
+layout(binding = 1) uniform sampler2D lb;      // this frame's
+layout(binding = 2) uniform sampler2D blockv;  // block-matching vectors (pixels), .z its cost
+layout(binding = 3) uniform sampler2D depth;   // this frame's scene depth, 0 near .. 1 far, over the whole crop
+layout(binding = 4, rgba16f) uniform writeonly image2D dst;
+layout(push_constant) uniform P {
+    vec4 m0, m1, m2;   // rows of last view * inverse(this view)
+    vec4 proj;         // P00, P11, linear depth: near / (d * proj.z + proj.w)
+    vec4 size;         // crop width, crop height, near, 0
+} pc;
+float sad(ivec2 ca, ivec2 cb) {
+    const ivec2 lm = textureSize(la, 0) - 1;
+    float s = 0.0;
+    for (int i = 0; i < 64; i++) {
+        const ivec2 o = ivec2(i % 8 - 4, i / 8 - 4);
+        s += abs(texelFetch(la, clamp(ca + o, ivec2(0), lm), 0).r - texelFetch(lb, clamp(cb + o, ivec2(0), lm), 0).r);
+    }
+    return s / 64.0;
+}
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(g, imageSize(dst)))) return;
+    const vec4 bv = texelFetch(blockv, g, 0);
+    const vec2 px = vec2(g) * 16.0 + 8.0;          // the block's centre in this frame
+    const vec2 uv = px / pc.size.xy;
+    const float d = textureLod(depth, uv, 0.0).r;
+    const float lin = pc.size.z / (d * pc.proj.z + pc.proj.w);
+    const vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    const vec4 v = vec4(ndc.x * lin / pc.proj.x, ndc.y * lin / pc.proj.y, -lin, 1.0);
+    const vec3 q = vec3(dot(pc.m0, v), dot(pc.m1, v), dot(pc.m2, v));
+    vec4 o = bv;
+    if (q.z < -1e-4) {
+        const vec2 pn = vec2(pc.proj.x * q.x, pc.proj.y * q.y) / -q.z;
+        const vec2 puv = vec2(pn.x * 0.5 + 0.5, 0.5 - pn.y * 0.5);
+        const vec2 cv = px - puv * pc.size.xy;      // last frame -> this frame, pixels
+        if (all(lessThan(abs(cv), vec2(256.0)))) {
+            const ivec2 cbq = ivec2(px / 4.0);
+            const float sc = sad(ivec2((px - cv) / 4.0), cbq);
+            const float sb = sad(ivec2((px - bv.xy) / 4.0), cbq);
+            if (sc <= sb + 0.004) o = vec4(cv, sc, 2.0);   // (.w 2: the camera's, for the log)
+        }
+    }
+    imageStore(dst, g, o);
+}

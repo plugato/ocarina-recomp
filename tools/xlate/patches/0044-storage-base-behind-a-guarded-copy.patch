@@ -1,0 +1,57 @@
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
+@@ -1265,8 +1265,8 @@
+                 return FindBaseAddressCbFromMemory(gtsContext, operation, 0, needsOffset);
+             }
+ 
+-            Operand src1 = operation.GetSource(0);
+-            Operand src2 = operation.GetSource(1);
++            Operand src1 = ResolveCbufSource(operation.GetSource(0), block);
++            Operand src2 = ResolveCbufSource(operation.GetSource(1), block);
+ 
+             int constOffset = 0;
+ 
+@@ -1302,8 +1302,8 @@
+                 }
+             }
+ 
+-            src1 = operation.GetSource(0);
+-            src2 = operation.GetSource(1);
++            src1 = ResolveCbufSource(operation.GetSource(0), block);
++            src2 = ResolveCbufSource(operation.GetSource(1), block);
+ 
+             // If we have two possible results, we give preference to the ones from
+             // the driver reserved constant buffer, as those are the ones that
+@@ -1323,6 +1323,32 @@
+             return GetBaseAddressCbWithOffset(src1, src2, constOffset);
+         }
+ 
++        // An addend of the address that holds a constant buffer value behind a phi or a copy: a predicated Ampere LEA with a
++        // constant buffer operand is lowered as a move of the operand into a scratch register under the same guard, then
++        // the add, so the add reads a phi of that register (Ocarina of Time's light volume vertex shaders: c0[0x110] + index,
++        // with c4[0x640] in the other phi source). The phi is resolved as the address itself is (FindLastOperation).
++        private static Operand ResolveCbufSource(Operand source, BasicBlock block)
++        {
++            if (source.Type != OperandType.LocalVariable)
++            {
++                return source;
++            }
++
++            Operand last = Utils.FindLastOperation(source, block);
++
++            if (last.Type == OperandType.ConstantBuffer)
++            {
++                return last;
++            }
++
++            if (last.AsgOp is Operation copy && copy.Inst == Instruction.Copy && copy.GetSource(0).Type == OperandType.ConstantBuffer)
++            {
++                return copy.GetSource(0);
++            }
++
++            return source;
++        }
++
+         private static SearchResult FindBaseAddressCbFromMemory(GtsContext gtsContext, Operation operation, int constOffset, bool needsOffset)
+         {
+             if (operation != null)

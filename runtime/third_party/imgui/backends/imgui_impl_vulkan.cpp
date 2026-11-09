@@ -409,7 +409,11 @@ static inline VkDeviceSize AlignBufferSize(VkDeviceSize size, VkDeviceSize align
     return (size + alignment - 1) & ~(alignment - 1);
 }
 
-static void CreateOrResizeBuffer(VkBuffer& buffer, VkDeviceMemory& buffer_memory, VkDeviceSize& buffer_size, VkDeviceSize new_size, VkBufferUsageFlagBits usage)
+// Local (RX 5500 XT, 4 GiB, Ocarina): an allocation can fail when the GPU memory is full, and the results were not looked
+// at: the handle just freed went on to vkBindBufferMemory and the next map, and the driver read through it. False leaves
+// nothing behind: the buffer stays empty, this frame's overlay is not drawn and the next frame tries again.
+// Tested: docs/test-environment-rx5500xt.md (forced failures at the title; F1 opened 12 times with the VRAM full).
+static bool CreateOrResizeBuffer(VkBuffer& buffer, VkDeviceMemory& buffer_memory, VkDeviceSize& buffer_size, VkDeviceSize new_size, VkBufferUsageFlagBits usage)
 {
     ImGui_ImplVulkan_Data* bd = ImGui_ImplVulkan_GetBackendData();
     ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
@@ -418,6 +422,9 @@ static void CreateOrResizeBuffer(VkBuffer& buffer, VkDeviceMemory& buffer_memory
         vkDestroyBuffer(v->Device, buffer, v->Allocator);
     if (buffer_memory != VK_NULL_HANDLE)
         vkFreeMemory(v->Device, buffer_memory, v->Allocator);
+    buffer = VK_NULL_HANDLE;
+    buffer_memory = VK_NULL_HANDLE;
+    buffer_size = 0;
 
     VkDeviceSize buffer_size_aligned = AlignBufferSize(IM_MAX(v->MinAllocationSize, new_size), bd->BufferMemoryAlignment);
     VkBufferCreateInfo buffer_info = {};
@@ -427,6 +434,11 @@ static void CreateOrResizeBuffer(VkBuffer& buffer, VkDeviceMemory& buffer_memory
     buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     err = vkCreateBuffer(v->Device, &buffer_info, v->Allocator, &buffer);
     check_vk_result(err);
+    if (err != VK_SUCCESS)
+    {
+        buffer = VK_NULL_HANDLE;
+        return false;
+    }
 
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(v->Device, buffer, &req);
@@ -435,12 +447,25 @@ static void CreateOrResizeBuffer(VkBuffer& buffer, VkDeviceMemory& buffer_memory
     alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     alloc_info.allocationSize = req.size;
     alloc_info.memoryTypeIndex = ImGui_ImplVulkan_MemoryType(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, req.memoryTypeBits);
-    err = vkAllocateMemory(v->Device, &alloc_info, v->Allocator, &buffer_memory);
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    err = vkAllocateMemory(v->Device, &alloc_info, v->Allocator, &memory);
     check_vk_result(err);
-
-    err = vkBindBufferMemory(v->Device, buffer, buffer_memory, 0);
-    check_vk_result(err);
+    if (err == VK_SUCCESS)
+    {
+        err = vkBindBufferMemory(v->Device, buffer, memory, 0);
+        check_vk_result(err);
+        if (err != VK_SUCCESS)
+            vkFreeMemory(v->Device, memory, v->Allocator);
+    }
+    if (err != VK_SUCCESS)
+    {
+        vkDestroyBuffer(v->Device, buffer, v->Allocator);
+        buffer = VK_NULL_HANDLE;
+        return false;
+    }
+    buffer_memory = memory;
     buffer_size = buffer_size_aligned;
+    return true;
 }
 
 static void ImGui_ImplVulkan_SetupRenderState(ImDrawData* draw_data, VkPipeline pipeline, VkCommandBuffer command_buffer, ImGui_ImplVulkan_FrameRenderBuffers* rb, int fb_width, int fb_height)
@@ -519,18 +544,27 @@ void ImGui_ImplVulkan_RenderDrawData(ImDrawData* draw_data, VkCommandBuffer comm
         // Create or resize the vertex/index buffers
         VkDeviceSize vertex_size = AlignBufferSize(draw_data->TotalVtxCount * sizeof(ImDrawVert), bd->BufferMemoryAlignment);
         VkDeviceSize index_size = AlignBufferSize(draw_data->TotalIdxCount * sizeof(ImDrawIdx), bd->BufferMemoryAlignment);
-        if (rb->VertexBuffer == VK_NULL_HANDLE || rb->VertexBufferSize < vertex_size)
-            CreateOrResizeBuffer(rb->VertexBuffer, rb->VertexBufferMemory, rb->VertexBufferSize, vertex_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-        if (rb->IndexBuffer == VK_NULL_HANDLE || rb->IndexBufferSize < index_size)
-            CreateOrResizeBuffer(rb->IndexBuffer, rb->IndexBufferMemory, rb->IndexBufferSize, index_size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+        if ((rb->VertexBuffer == VK_NULL_HANDLE || rb->VertexBufferSize < vertex_size) &&
+            !CreateOrResizeBuffer(rb->VertexBuffer, rb->VertexBufferMemory, rb->VertexBufferSize, vertex_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT))
+            return;
+        if ((rb->IndexBuffer == VK_NULL_HANDLE || rb->IndexBufferSize < index_size) &&
+            !CreateOrResizeBuffer(rb->IndexBuffer, rb->IndexBufferMemory, rb->IndexBufferSize, index_size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT))
+            return;
 
         // Upload vertex/index data into a single contiguous GPU buffer
         ImDrawVert* vtx_dst = nullptr;
         ImDrawIdx* idx_dst = nullptr;
         VkResult err = vkMapMemory(v->Device, rb->VertexBufferMemory, 0, vertex_size, 0, (void**)&vtx_dst);
         check_vk_result(err);
+        if (err != VK_SUCCESS)
+            return;
         err = vkMapMemory(v->Device, rb->IndexBufferMemory, 0, index_size, 0, (void**)&idx_dst);
         check_vk_result(err);
+        if (err != VK_SUCCESS)
+        {
+            vkUnmapMemory(v->Device, rb->VertexBufferMemory);
+            return;
+        }
         for (int n = 0; n < draw_data->CmdListsCount; n++)
         {
             const ImDrawList* draw_list = draw_data->CmdLists[n];
@@ -700,6 +734,11 @@ bool ImGui_ImplVulkan_CreateFontsTexture()
         info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         err = vkCreateImage(v->Device, &info, v->Allocator, &backend_tex->Image);
         check_vk_result(err);
+        if (err != VK_SUCCESS)
+        {
+            backend_tex->Image = VK_NULL_HANDLE;
+            return false;
+        }
         VkMemoryRequirements req;
         vkGetImageMemoryRequirements(v->Device, backend_tex->Image, &req);
         VkMemoryAllocateInfo alloc_info = {};
@@ -708,6 +747,13 @@ bool ImGui_ImplVulkan_CreateFontsTexture()
         alloc_info.memoryTypeIndex = ImGui_ImplVulkan_MemoryType(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, req.memoryTypeBits);
         err = vkAllocateMemory(v->Device, &alloc_info, v->Allocator, &backend_tex->Memory);
         check_vk_result(err);
+        if (err != VK_SUCCESS)
+        {
+            vkDestroyImage(v->Device, backend_tex->Image, v->Allocator);
+            backend_tex->Image = VK_NULL_HANDLE;
+            backend_tex->Memory = VK_NULL_HANDLE;
+            return false;
+        }
         err = vkBindImageMemory(v->Device, backend_tex->Image, backend_tex->Memory, 0);
         check_vk_result(err);
     }
@@ -740,6 +786,11 @@ bool ImGui_ImplVulkan_CreateFontsTexture()
         buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         err = vkCreateBuffer(v->Device, &buffer_info, v->Allocator, &upload_buffer);
         check_vk_result(err);
+        if (err != VK_SUCCESS)
+        {
+            ImGui_ImplVulkan_DestroyFontsTexture();
+            return false;
+        }
         VkMemoryRequirements req;
         vkGetBufferMemoryRequirements(v->Device, upload_buffer, &req);
         bd->BufferMemoryAlignment = (bd->BufferMemoryAlignment > req.alignment) ? bd->BufferMemoryAlignment : req.alignment;
@@ -749,6 +800,12 @@ bool ImGui_ImplVulkan_CreateFontsTexture()
         alloc_info.memoryTypeIndex = ImGui_ImplVulkan_MemoryType(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, req.memoryTypeBits);
         err = vkAllocateMemory(v->Device, &alloc_info, v->Allocator, &upload_buffer_memory);
         check_vk_result(err);
+        if (err != VK_SUCCESS)
+        {
+            vkDestroyBuffer(v->Device, upload_buffer, v->Allocator);
+            ImGui_ImplVulkan_DestroyFontsTexture();
+            return false;
+        }
         err = vkBindBufferMemory(v->Device, upload_buffer, upload_buffer_memory, 0);
         check_vk_result(err);
     }

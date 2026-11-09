@@ -234,7 +234,8 @@ function Exec([string]$exe, [string[]]$argumentos, [switch]$PodeFalhar, [string]
     $destino = if ($Saida) { "> `"$Saida`"" } else { ">> `"$LOG`"" }
     Registrar "> $exe $q"
     $psi = New-Object Diagnostics.ProcessStartInfo
-    $psi.FileName = "$env:ComSpec"
+    # ComSpec can be missing from the environment (issue #102: "nao foi fornecido um nome de arquivo")
+    $psi.FileName = if ($env:ComSpec -and (Test-Path -LiteralPath $env:ComSpec)) { $env:ComSpec } else { Join-Path $env:SystemRoot 'System32\cmd.exe' }
     $psi.Arguments = "/d /s /c `"`"$exe`" $q $destino 2>&1`""
     $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
     if (Test-Path $script:pasta) { $psi.WorkingDirectory = $script:pasta }
@@ -356,16 +357,26 @@ function P-Shaders() {
     $seed = Join-Path $script:pasta 'tools\data\oot-seed'
     $dir = Build 'oot111'
     if (-not (Test-Path (Join-Path $seed 'seed-answers.bin'))) { Registrar 'shaders: sem semente, passo pulado'; return }
-    if (Test-Path (Join-Path $dir 'shader-prepared.bin')) { return }
+    # Prepared again when the version or the translator changes: the lowering (runtime) and the translator make the
+    # shaders, so the earlier preparation no longer matches and the first start would build them in play again.
+    $marca = Join-Path $dir 'shader-prepared.txt'
+    $idx = Join-Path $script:pasta 'build\xlate\totk_xlate.id'
+    $chave = (Get-Content -LiteralPath (Join-Path $script:pasta 'VERSION') -Raw).Trim() + ' ' + $(if (Test-Path -LiteralPath $idx) { (Get-Content -LiteralPath $idx -Raw).Trim() } else { '' })
+    $feita = if (Test-Path -LiteralPath $marca) { (Get-Content -LiteralPath $marca -Raw).Trim() } else { '' }
+    if ((Test-Path (Join-Path $dir 'shader-prepared.bin')) -and $feita -eq $chave) { return }
     $pack = Build 'shader-stages.pack'
     $exe = Join-Path $dir 'ocarina.exe'
     try {
         Exec $script:py @('-I', 'tools\oot\shader_extract.py', '--romfs-image', (Build 'romfs\romfs.bin'), '--index', (Build 'romfs\index.json'), '--pack', $pack) | Out-Null
         Exec $exe @('--lower-stages', $pack, $dir) | Out-Null
         Copy-Item -LiteralPath (Join-Path $seed 'seed-answers.bin') -Destination (Join-Path $dir 'seed-answers.bin') -Force
-        # the player's own keys, from earlier play, are kept
-        if (-not (Test-Path (Join-Path $dir 'pipeline-keys.bin'))) { Copy-Item -LiteralPath (Join-Path $seed 'pipeline-keys.bin') -Destination (Join-Path $dir 'pipeline-keys.bin') }
+        # the player's own keys, from earlier play, are kept and the seed's are added to them: an update's seed names
+        # pipelines (the vegetation's) that a player's earlier keys do not, and they were built in play then
+        $chaves = Join-Path $dir 'pipeline-keys.bin'
+        if (Test-Path -LiteralPath $chaves) { Exec $script:py @('-I', 'tools\oot\merge_records.py', $chaves, $chaves, (Join-Path $seed 'pipeline-keys.bin')) | Out-Null }
+        else { Copy-Item -LiteralPath (Join-Path $seed 'pipeline-keys.bin') -Destination $chaves }
         Exec $exe @('--prepare-shaders') | Out-Null
+        Set-Content -LiteralPath $marca -Value $chave -Encoding ascii
     } catch {
         if ("$($_.Exception.Message)" -eq 'CANCELADO') { throw }
         Registrar "shaders: a preparação falhou, o jogo monta os shaders ao jogar: $($_.Exception.Message)"
@@ -464,11 +475,14 @@ function PastaPadrao() {
 function Validar() {
     $problema = @()
     $unid = $script:pasta.Substring(0, 1)
-    $livre = [Math]::Floor((Get-PSDrive $unid).Free / 1GB)
+    # DriveInfo, not Get-PSDrive: an F: drive with 403 GB free read as 0 GB and Instalar stayed off (issue #114).
+    # When the size cannot be read the install is not blocked: the step that runs out of space says so.
+    $livre = try { $di = New-Object IO.DriveInfo $unid; if ($di.IsReady) { [Math]::Floor($di.AvailableFreeSpace / 1GB) } else { -1 } } catch { -1 }
     $parcial = Test-Path (Join-Path $script:pasta 'build\romfs\index.json')
     if ($script:pasta -match '[^\x21-\x7E]|[\[\]%&]') { $problema += (L 'A pasta de instalação não pode ter espaços nem acentos.' 'The install folder cannot have spaces or accents.') }
-    elseif (-not $parcial -and $livre -lt $GB_NECESSARIOS) { $problema += (L "Faltam $($GB_NECESSARIOS - $livre) GB livres em ${unid}: (precisa de $GB_NECESSARIOS GB)." "You need $($GB_NECESSARIOS - $livre) GB more free on ${unid}: ($GB_NECESSARIOS GB required).") }
-    $lbPasta.Text = (L "$($script:pasta)   ($livre GB livres)" "$($script:pasta)   ($livre GB free)")
+    elseif (-not $parcial -and $livre -ge 0 -and $livre -lt $GB_NECESSARIOS) { $problema += (L "Faltam $($GB_NECESSARIOS - $livre) GB livres em ${unid}: (precisa de $GB_NECESSARIOS GB)." "You need $($GB_NECESSARIOS - $livre) GB more free on ${unid}: ($GB_NECESSARIOS GB required).") }
+    $txt = if ($livre -ge 0) { "$livre" } else { "?" }
+    $lbPasta.Text = (L "$($script:pasta)   ($txt GB livres)" "$($script:pasta)   ($txt GB free)")
     $lbAviso.Text = ($problema + @($script:avisos | ForEach-Object { Pick $_ })) -join "`n"
     $pronta = JaInstalada $script:pasta
     if ($pronta -and -not $script:jogo) { $script:jogoEstado = 'pronta' }

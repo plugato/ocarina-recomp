@@ -124,6 +124,9 @@ void vk_exec_pass_end(VkExec *ex);
 // Full memory barrier (all commands, all memory); ends the open pass first. Copies and dispatches order themselves with
 // it. Skipped when nothing was recorded since the last one.
 void vk_exec_barrier(VkExec *ex);
+void oot_motion_note(VkExec *ex);       // oot_motion.c: the probe draw (prepare_draw)
+void oot_motion_pass_end(VkExec *ex);   // after its pass: the depth copy
+void vk_exec_forget_compute(void);      // vk_exec_draw.c: a compute pipeline was bound outside the bind state
 // vk_texture.c (TOTK_TEX_ALIAS): commands that must run at the replay's current position. vk_exec_inline_begin returns
 // the command buffer being recorded after a full barrier (an open pass is ended; *reopen says so), or VK_NULL_HANDLE
 // when this thread is not recording a replay. vk_exec_inline_end begins the pass again when it was open.

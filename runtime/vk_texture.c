@@ -64,6 +64,9 @@ typedef struct Tex {
     uint64_t use_seq;             // order of the last creation or take-back among all entries
     uint64_t rel_seq;             // while released: use_seq of the newest entry placed before this release; an entry
                                   // with a later use_seq on overlapping storage replaced this one's bytes
+    uint32_t rel_epoch;           // submit_epoch when it was released (sweep_short)
+    uint32_t astc_epoch;          // submit_epoch of the last upload that could not decode (upload)
+    uint8_t astc_tries;           // uploads in a row that could not decode for lack of memory
 } Tex;
 
 // A slot keeps what vk_texture_by_id resolved for it, so a draw binding skips the key lookup and the address chain: the
@@ -96,6 +99,7 @@ static nvn_hmap samplers = {.klen = sizeof(samp_par)};
 static int nreleased;
 static Tex *rel_head, *rel_tail;   // released entries in release order (sweep_released drops from the head)
 static uint64_t n_uploads, n_reuploads;
+static uint64_t n_create_failed;      // images that could not be created since the last perf line
 // Re-uploads since the last perf line (tex_lock): all, and those of textures a WriteTexels wrote since their last upload.
 static uint64_t ru_n, ru_bytes, ru_ns, ru_wt_n, ru_wt_bytes, ru_wt_ns;
 // TOTK_TEX_ALIAS (default on; =0: a new image over live storage starts empty): a new descriptor over the storage of a
@@ -425,6 +429,8 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         VkResult r = vmaCreateImage(c->vma, &ci, &ai, &img, &e->alloc, NULL);
         if (r != VK_SUCCESS) {
+            vk_texture_vram_short((uint64_t)L.size * 2);
+            n_create_failed++;
             log_limited(&n_failed, "image creation failed (%d): nvn fmt %#x %ux%ux%u target %d levels %u layers %u", (int)r,
                         d->format, w, h, depth, d->target, levels, layers);
             free(e);
@@ -719,6 +725,52 @@ static void sweep_pressure(void) {   // tex_lock held
     }
 }
 
+// An allocation failed for lack of memory (create_tex, the ASTC scratch buffer). sweep_pressure only takes entries that
+// come back intact, and on a 4 GiB card most of the released VRAM is in the others: 1.1 of 3.7 GiB in Ocarina's forest
+// while depth buffers and ASTC decodes failed. So, only after a failure, the oldest released entries with their own memory
+// go whatever they are, once nothing has taken them back for EVICT_MIN_AGE submits (a transient target is taken back
+// within frames). Nothing waits for them: the texture that failed is tried again at its next use (entry_of, make_fresh),
+// and the memory comes back when the GPU is done with the submissions that may still name them. EVICT_COOLDOWN gives it
+// that time, or every failure until then would drop another batch. A few per submit, for the reason at RELEASED_MAX.
+// Tested: docs/test-environment-rx5500xt.md (5 min in the forest: 262 textures, 474 MiB dropped; 612 of the 631 images
+// that could not be created were at the map load; released textures left empty did not increase).
+#define EVICT_MIN_AGE 1200
+#define EVICT_COOLDOWN 24
+#define EVICT_STEP 64
+#define EVICT_MIN_BYTES (64ull << 20)
+static uint64_t evict_want;           // bytes the next sweep_short should free (atomic: the ASTC decoder sets it too)
+static uint32_t evict_last;           // submit_epoch of the last sweep that dropped something
+static uint64_t n_evicted, n_evicted_bytes;
+
+void vk_texture_vram_short(uint64_t bytes) {
+    if (bytes < EVICT_MIN_BYTES) bytes = EVICT_MIN_BYTES;
+    __atomic_store_n(&evict_want, bytes, __ATOMIC_RELAXED);
+}
+
+static void sweep_short(void) {   // tex_lock held
+    static volatile int32_t n_log;
+    if (!__atomic_load_n(&evict_want, __ATOMIC_RELAXED)) return;
+    if (evict_last && submit_epoch - evict_last < EVICT_COOLDOWN) return;
+    uint64_t want = __atomic_exchange_n(&evict_want, 0, __ATOMIC_RELAXED), freed = 0;
+    VkCtx *c = vk_ctx();
+    int dropped = 0;
+    for (Tex *e = rel_head, *next; c && e && dropped < EVICT_STEP && freed < want; e = next) {
+        next = e->rel_next;
+        if (submit_epoch - e->rel_epoch < EVICT_MIN_AGE) break;   // the list is in release order: the rest are younger
+        if (!e->alloc) continue;   // bound into pool memory: dropping it gives no VRAM back
+        VmaAllocationInfo ai;
+        vmaGetAllocationInfo(c->vma, e->alloc, &ai);
+        freed += ai.size;
+        destroy_tex(e);
+        dropped++;
+    }
+    if (!dropped) return;
+    evict_last = submit_epoch;
+    n_evicted += (uint64_t)dropped, n_evicted_bytes += freed;
+    log_limited(&n_log, "vk: out of memory: %d old released textures dropped (%.1f MiB of %.1f wanted), %d still released",
+                dropped, freed / 1048576.0, want / 1048576.0, nreleased);
+}
+
 // ---------------------------------------------------------------- uploads
 static uint32_t texel_alpha_one(int format, uint32_t *elem) {
     switch (format) {
@@ -789,6 +841,14 @@ static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar,
                (unsigned long long)n_texels, (unsigned long long)n_diff_tex);
 }
 
+// An ASTC upload whose decode found no memory for its scratch buffer stays not uploaded, so a later use tries again:
+// sweep_short has been asked for room. Every ASTC_RETRY_GAP submits at most (an attempt copies the whole texture), and
+// ASTC_TRIES times before the texture is left as it was. It used to count as uploaded at the first failure: the image
+// held whatever its memory held for as long as it lived (the noise behind Ocarina's controls page).
+// Tested: docs/test-environment-rx5500xt.md (every failure the log kept was decoded at its first new attempt).
+#define ASTC_RETRY_GAP 240
+#define ASTC_TRIES 30
+
 // Staging bytes of one part of a texture upload decoded or copied on the CPU (see upload). With TOTK_ASTC=cpu a
 // large ASTC array decodes to RGBA8 in one go: a staging buffer of 676682336 bytes failed (-2) on an Intel UHD with
 // 8 GB of shared memory and the game closed before the title screen.
@@ -796,11 +856,12 @@ static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar,
 
 // Copies the whole storage into the image (every level and layer the image has).
 static void upload(Tex *e) {
-    static volatile int32_t n_bad, n_undecoded, n_split;
+    static volatile int32_t n_bad, n_undecoded, n_split, n_recovered;
     const tex_t *t = &e->t;
     const nvn_texdesc *d = &t->d;
     int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
     if (!bpb || !t->mem) return;
+    if (e->astc_tries && submit_epoch - e->astc_epoch < ASTC_RETRY_GAP) return;
     uint64_t p0 = perf_begin(), u0 = kern_now_ns();
     int linear = nvn_tex_is_linear(d), is3d = d->target == NVN_TEXTURE_TARGET_3D, one_d = e->pub.type == VK_IMAGE_TYPE_1D;
     uint32_t levels = linear ? 1 : e->pub.levels, layers = linear ? 1 : e->pub.layers;
@@ -814,7 +875,8 @@ static void upload(Tex *e) {
         for (uint32_t ly = 0; ly < layers; ly++) {
             uint32_t w = mip(d->width, lv), h = one_d ? 1 : mip(d->height, lv), sl = is3d ? mip(d->depth, lv) : 1;
             uint64_t texels = (uint64_t)w * h * sl, raw = (uint64_t)(w + bw - 1) / bw * bpb * ((h + bh - 1) / bh) * sl;
-            uint64_t out = agpu ? raw : astc ? texels * 4 : rgb ? texels * (uint64_t)bpb / 3 * 4 : raw;
+            uint64_t bc = (uint64_t)(w + 3) / 4 * ((h + 3) / 4) * 16 * sl;   // ASTC as BC3 from the CPU decoder
+            uint64_t out = agpu ? raw : astc ? (e->f.astc_bc ? bc : texels * 4) : rgb ? texels * (uint64_t)bpb / 3 * 4 : raw;
             rg[k++] = (VkBufferImageCopy){.bufferOffset = total, .imageSubresource = {e->pub.aspect, lv, ly, 1},
                                           .imageExtent = {w, h, sl}};
             total += (out + 15) & ~15ull;
@@ -851,11 +913,17 @@ static void upload(Tex *e) {
                 ar[k] = (VkAstcRegion){.src = rg[k].bufferOffset, .w = w, .h = h, .slices = sl, .level = lv, .layer = ly};
             } else if (astc) {
                 uint64_t a0 = perf_begin();
-                for (uint32_t z = 0; z < sl; z++)
+                uint8_t *px = e->f.astc_bc ? malloc((size_t)w * h * 4) : NULL;
+                if (e->f.astc_bc && !px) rt_fatal("vk: out of memory for a BC3 encode");
+                for (uint32_t z = 0; z < sl; z++) {
                     astc_decode_ldr_mt(tmp + (size_t)z * rb * rows, w, h, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb,
-                                       dst + (size_t)z * w * h * 4);
+                                       px ? px : dst + (size_t)z * w * h * 4);
+                    if (px) bc3_encode_mt(px, w, h, dst + (size_t)z * ((w + 3) / 4) * ((h + 3) / 4) * 16);
+                }
+                free(px);
                 perf_end(PERF_ASTC, a0);
-                rg[k].bufferRowLength = w, rg[k].bufferImageHeight = h;
+                // BC3: tightly packed blocks (row length 0); RGBA8: w texels a row
+                if (!e->f.astc_bc) rg[k].bufferRowLength = w, rg[k].bufferImageHeight = h;
             } else if (rgb) {
                 expand_rgb(d->format, tmp, dst, (size_t)w * h * sl);
                 rg[k].bufferRowLength = w, rg[k].bufferImageHeight = h;
@@ -874,8 +942,8 @@ static void upload(Tex *e) {
             checked = vk_astc_record(cb, sb, size, ar, (int)n, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb, e->f.astc_bc,
                                      e->pub.image, e->pub.aspect, rbuf);
             perf_end(PERF_ASTC, a0);
-            if (!checked)
-                log_limited(&n_undecoded, "ASTC texture %#llx (fmt %#x %ux%u) not decoded on the GPU: left as it was",
+            if (!checked && !e->astc_tries)
+                log_limited(&n_undecoded, "ASTC texture %#llx (fmt %#x %ux%u) not decoded on the GPU: will try again",
                             (unsigned long long)e->pub.addr, d->format, d->width, d->height);
         } else {
             vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, k1 - k0, rg + k0);
@@ -898,6 +966,16 @@ static void upload(Tex *e) {
     free(raw_copy);
     free(ar);
     free(rg);
+    if (agpu && !checked && e->astc_tries < ASTC_TRIES) {
+        e->astc_tries++, e->astc_epoch = submit_epoch, e->uploaded = 0;
+        perf_end(PERF_TEX, p0);
+        return;
+    }
+    if (agpu && checked && e->astc_tries) {
+        log_limited(&n_recovered, "ASTC texture %#llx (fmt %#x %ux%u) decoded after %u failed attempts",
+                    (unsigned long long)e->pub.addr, d->format, d->width, d->height, (unsigned)e->astc_tries);
+        e->astc_tries = 0;
+    }
     uint64_t dt = kern_now_ns() - u0;
     if (e->uploaded) {
         n_reuploads++, perf_count(PERF_CNT_TEX_REUP);
@@ -1205,6 +1283,7 @@ void vk_texture_release(const tex_t *t) {
         e->released = 1;
         e->rel_ms = coarse_ms;
         e->rel_seq = use_counter;
+        e->rel_epoch = submit_epoch;
         nreleased++;
         rel_append(e);
         tex_gen_bump(k.addr);
@@ -1302,6 +1381,15 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
         if (!e) e = any ? any : own;
     }
     if (!e) e = s->t.mem ? entry_of(&s->t) : NULL;
+    // A followed RGB9E5 descriptor over an R11G11B10F image reads the bytes as RGB9E5, as Maxwell does. Ocarina's tone map
+    // packs RGB9E5 by hand through an R32UI view; the RGB9E5 texture is made anew each frame, so the upscale network's
+    // slot followed the R11G11B10F target at that storage, read the bits as R11G11B10F (NaN and inf) and drew black.
+    // ponytail: this pair only; other formats of one size would need the same view (vk_exec_draw.c get_view)
+    if (e && s->t.d.format == 0x40 && e->t.d.format == 0x3f && !(s->has_view && s->v.set_format)) {
+        if (!*has_view) memset(view, 0, sizeof *view);
+        view->set_format = 1, view->format = 0x40;
+        *has_view = 1;
+    }
     // A followed texture is another descriptor at the same storage: its image holds the content, but sampling takes the
     // slot descriptor's swizzle. The UI renders text into RGBA8 and samples it through a (A,A,A,A) descriptor; with the
     // render target's RGBA swizzle the text blur saw R = 1 everywhere and drew solid boxes behind tips and labels.
@@ -1393,6 +1481,7 @@ void vk_texture_new_submit(void) {
     if (!++submit_epoch) submit_epoch = 1;
     coarse_ms = plat_now_ms();
     sweep_pressure();
+    sweep_short();
     static uint64_t log_at;
     uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) / 60;
     if ((rt_trace & RT_TRACE_PERF) && f != log_at && tex_alias > 0) {
@@ -1411,10 +1500,12 @@ void vk_texture_new_submit(void) {
                (unsigned long long)f * 60, (unsigned long long)ck, (unsigned long long)n_checks, (unsigned long long)calls,
                (unsigned long long)untr);
         n_checks = 0;
-        rt_log("perf: frame %llu: released textures kept %d, dropped under VRAM pressure %llu (%llu overwritten)",
+        rt_log("perf: frame %llu: released textures kept %d, dropped under VRAM pressure %llu (%llu overwritten), dropped after a "
+               "failed allocation %llu (%.0f MiB); images that could not be created %llu",
                (unsigned long long)f * 60, nreleased, (unsigned long long)n_pressure_drops,
-               (unsigned long long)n_pressure_overwritten);
-        n_pressure_drops = n_pressure_overwritten = 0;
+               (unsigned long long)n_pressure_overwritten, (unsigned long long)n_evicted, n_evicted_bytes / 1048576.0,
+               (unsigned long long)n_create_failed);
+        n_pressure_drops = n_pressure_overwritten = n_evicted = n_evicted_bytes = n_create_failed = 0;
     }
     unlock();
 }
@@ -1544,6 +1635,8 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
     int rgb = e->f.expand_rgb, astc = e->f.astc_bw != 0, agpu = astc && vk_astc_gpu();
     size_t texels = (size_t)w * h, ib = agpu ? 0 : astc ? 4 : rgb ? (size_t)g->bpb / 3 * 4 : 0;
     size_t slice = ib ? texels * ib : g->wb * g->hb;   // agpu: the raw blocks, decoded by vk_astc_record
+    int cbc = astc && !agpu && e->f.astc_bc;           // the CPU decoder's BC3 (tex_bc3.c): whole blocks
+    if (cbc) slice = (size_t)((w + 3) / 4) * ((h + 3) / 4) * 16;
     VkBuffer sb;
     VmaAllocation sa;
     uint8_t *stg = vk_staging(slice * (size_t)g->nz, &sb, &sa);
@@ -1557,7 +1650,11 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
             uint8_t *tight = malloc(g->wb * g->hb);
             for (size_t y = 0; y < g->hb; y++) memcpy(tight + y * g->wb, m + y * g->row, g->wb);
             uint64_t a0 = perf_begin();
-            astc_decode_ldr_mt(tight, w, h, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb, s);
+            uint8_t *px = cbc ? malloc(texels * 4) : NULL;
+            if (cbc && !px) rt_fatal("vk: out of memory for a BC3 encode");
+            astc_decode_ldr_mt(tight, w, h, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb, px ? px : s);
+            if (px) bc3_encode_mt(px, w, h, s);
+            free(px);
             perf_end(PERF_ASTC, a0);
             free(tight);
         } else if (rgb) {
@@ -1590,7 +1687,9 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
         perf_end(PERF_ASTC, a0);
         free(ar);
     }
-    if (!agpu) vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)g->nz, rg);
+    if (!agpu && !(cbc && bc_cut)) vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)g->nz, rg);
+    else if (!agpu) log_limited(&n_astc, "WriteTexels of ASTC texture %#llx ends inside a BC3 block: left as it was",
+                                (unsigned long long)e->pub.addr);
     else if (!done) log_limited(&n_astc, "WriteTexels of ASTC texture %#llx not decoded on the GPU: left as it was",
                                 (unsigned long long)e->pub.addr);
     barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);

@@ -263,6 +263,7 @@ static class SwshXlate
                 NxMesh.Threads = 0;
                 NxMesh.IsTask = false;
                 NxMesh.PayloadWords = 0;
+                NxMesh.PrimLines = [];
                 if (job["task"] is JsonArray taskJob)
                 {
                     NxMesh.Threads = (int)taskJob[0];
@@ -285,6 +286,19 @@ static class SwshXlate
                     NxMesh.MaxPrimitives = (int)meshJob[2];
                     NxMesh.Lines = meshLines.ToArray();
                     NxMesh.PayloadWords = (int)meshJob[3];
+                    if (job["prim"] is JsonNode primJob)
+                    {
+                        // The per-primitive output map: the program header after the code, bytes 0x35..0x45 of it
+                        // (system bits, then one nibble per generic), 17 bytes in hex.
+                        byte[] pm = Convert.FromHexString((string)primJob);
+                        var primLines = new List<int>();
+                        for (int bit = 0; bit < 8; bit++)
+                            if ((pm[0] >> bit & 1) != 0) primLines.Add(-1 - bit);
+                        for (int generic = 0; generic < 32; generic++)
+                            for (int element = 0; element < 4; element++)
+                                if ((pm[1 + generic / 2] >> (generic % 2 * 4 + element) & 1) != 0) primLines.Add(generic * 4 + element);
+                        NxMesh.PrimLines = primLines.ToArray();
+                    }
                 }
                 var acc = new Accessor(code, job);
                 // 作业 debug = false：关 DebugMode（DebugMode 会跳过 AST 优化器，产物满是临时变量；不改语义）

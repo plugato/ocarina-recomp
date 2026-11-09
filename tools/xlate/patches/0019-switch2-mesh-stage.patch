@@ -1,6 +1,71 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+@@ -127,7 +127,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+ 
+                 if (decoratedTypes.Add(structType))
+                 {
+-                    context.Decorate(structType, isBuffer ? Decoration.BufferBlock : Decoration.Block);
++                    context.Decorate(structType, isBuffer && !NxMesh.Active ? Decoration.BufferBlock : Decoration.Block);
+ 
+                     for (int fieldIndex = 0; fieldIndex < structFieldOffsets.Length; fieldIndex++)
+                     {
+@@ -135,8 +135,10 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+                     }
+                 }
+ 
+-                SpvInstruction pointerType = context.TypePointer(StorageClass.Uniform, structType);
+-                SpvInstruction variable = context.Variable(pointerType, StorageClass.Uniform);
++                // SPIR-V 1.4, needed by mesh stages, has no BufferBlock: storage buffers use their own class there.
++                StorageClass bufferClass = isBuffer && NxMesh.Active ? StorageClass.StorageBuffer : StorageClass.Uniform;
++                SpvInstruction pointerType = context.TypePointer(bufferClass, structType);
++                SpvInstruction variable = context.Variable(pointerType, bufferClass);
+ 
+                 context.Name(variable, buffer.Name);
+                 context.Decorate(variable, Decoration.DescriptorSet, (LiteralInteger)setIndex);
+@@ -399,10 +401,16 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+                 bool isOutput = ioDefinition.StorageKind.IsOutput();
+                 bool isPerPatch = ioDefinition.StorageKind.IsPerPatch();
+ 
+-                DeclareInputOrOutput(context, ioDefinition, isOutput, isPerPatch, iq, firstLocation);
++                if (!(NxMesh.Active && isOutput))   // a mesh program's outputs are the arrays its entry point declares
++                {
++                    DeclareInputOrOutput(context, ioDefinition, isOutput, isPerPatch, iq, firstLocation);
++                }
+             }
+ 
+-            DeclarePerVertexBlock(context);
++            if (!NxMesh.Active)
++            {
++                DeclarePerVertexBlock(context);
++            }
+         }
+ 
+         private static void DeclarePerVertexBlock(CodeGenContext context)
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -542,7 +542,9 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+ 
+         private static OperationResult GenerateExponentB2(CodeGenContext context, AstOperation operation)
+         {
+-            return GenerateUnary(context, operation, context.Delegates.GlslExp2, null);
++            // LOCAL TEST (Ocarina): pow(0, c) arrives as exp2(log2(0) * c): exp2(-inf) gives NaN on NVIDIA where the console
++            // gives 0, and that NaN turned whole frames white. Below 2^-1022 everything is zero in 32 bits anyway.
++            return GenerateUnary(context, operation, (type, x) => context.Delegates.GlslExp2(type, context.Delegates.GlslFMax(type, x, context.Constant(type, -1022f))), null);
+         }
+ 
+         private static OperationResult GenerateFSIBegin(CodeGenContext context, AstOperation operation)
+@@ -1814,7 +1816,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+                         : context.Properties.StorageBuffers[bindingIndex.Value];
+                     StructureField field = buffer.Type.Fields[fieldIndex.Value];
+ 
+-                    storageClass = StorageClass.Uniform;
++                    storageClass = storageKind == StorageKind.StorageBuffer && NxMesh.Active ? StorageClass.StorageBuffer : StorageClass.Uniform;
+                     varType = field.Type & AggregateType.ElementTypeMask;
+                     baseObj = storageKind == StorageKind.ConstantBuffer
+                         ? context.ConstantBuffers[bindingIndex.Value]
 --- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SpirvGenerator.cs
 +++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SpirvGenerator.cs
-@@ -45,6 +45,13 @@
+@@ -45,6 +45,13 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
  
              context.AddCapability(Capability.Shader);
  
@@ -14,7 +79,7 @@
              context.SetMemoryModel(AddressingModel.Logical, MemoryModel.GLSL450);
  
              context.AddCapability(Capability.GroupNonUniformBallot);
-@@ -158,6 +165,212 @@
+@@ -158,6 +165,263 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
              return result;
          }
  
@@ -106,6 +171,28 @@
 +                {
 +                    target[i] = position;     // system bits 4-7
 +                    element[i] = -lines[i] - 5;
++                }
++            }
++
++            // Per-primitive outputs (the primitive header's map): arrays of MaxPrimitives, decorated PerPrimitiveEXT (5271).
++            int[] primLines = NxMesh.PrimLines ?? [];
++            System.Collections.Generic.Dictionary<int, SpvInstruction> primGenerics = [];
++            SpvInstruction[] primTarget = new SpvInstruction[primLines.Length];
++            int[] primElement = new int[primLines.Length];
++            for (int i = 0; i < primLines.Length; i++)
++            {
++                if (primLines[i] >= 0)
++                {
++                    int generic = primLines[i] / 4;
++                    if (!primGenerics.TryGetValue(generic, out SpvInstruction pvariable))
++                    {
++                        pvariable = Output(vec4, maxPrimitives);
++                        c.Decorate(pvariable, Decoration.Location, (SpvLiteralInteger)generic);
++                        c.Decorate(pvariable, (Decoration)5271);
++                        primGenerics.Add(generic, pvariable);
++                    }
++                    primTarget[i] = pvariable;
++                    primElement[i] = primLines[i] % 4;
 +                }
 +            }
 +
@@ -205,6 +292,35 @@
 +
 +                If(c.ULessThan(boolean, primitive, limited), () =>
 +                {
++                    if (primLines.Length != 0)
++                    {
++                        SpvInstruction pgroup = c.ShiftRightLogical(u32, primitive, Const(5));
++                        SpvInstruction pslot = c.BitwiseAnd(u32, primitive, Const(31));
++                        SpvInstruction pstart = c.IAdd(u32, c.IMul(u32, pgroup, Const(primLines.Length * 32)), pslot);
++
++                        foreach ((int generic, SpvInstruction output) in primGenerics)
++                        {
++                            for (int component = 0; component < 4; component++)
++                            {
++                                if (System.Array.IndexOf(primLines, generic * 4 + component) < 0)
++                                {
++                                    c.Store(c.AccessChain(outF32, output, primitive, Const(component)), c.Constant(f32, component == 3 ? 1f : 0f));
++                                }
++                            }
++                        }
++
++                        for (int line = 0; line < primLines.Length; line++)
++                        {
++                            if (primTarget[line] == null)
++                            {
++                                continue;
++                            }
++
++                            SpvInstruction pword = c.Load(u32, Word(c.IAdd(u32, pstart, Const(NxMesh.VertexWords + line * 32))));
++                            c.Store(c.AccessChain(outF32, primTarget[line], primitive, Const(primElement[line])), c.Bitcast(f32, pword));
++                        }
++                    }
++
 +                    // Vertex indices: map bytes 4 + 3 * primitive.
 +                    SpvInstruction bytes = c.IAdd(u32, c.IMul(u32, primitive, Const(3)), Const(4 + NxMesh.AttributeWords));
 +                    SpvInstruction a = c.Load(u32, Word(bytes));
@@ -227,7 +343,7 @@
          private static void Generate(CodeGenContext context, StructuredProgramInfo info, int funcIndex)
          {
              (StructuredFunction function, SpvInstruction spvFunc) = context.GetFunction(funcIndex);
-@@ -185,6 +339,12 @@
+@@ -185,6 +449,12 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
  
              if (funcIndex == 0)
              {
@@ -242,7 +358,7 @@
                  if (context.Definitions.Stage == ShaderStage.TessellationControl)
 --- a/src/Ryujinx.Graphics.Shader/Decoders/InstName.cs
 +++ b/src/Ryujinx.Graphics.Shader/Decoders/InstName.cs
-@@ -75,6 +75,7 @@
+@@ -75,6 +75,7 @@ namespace Ryujinx.Graphics.Shader.Decoders
          Imul32i,
          Ipa,
          Isberd,
@@ -252,7 +368,7 @@
          Iset,
 --- a/src/Ryujinx.Graphics.Shader/Decoders/InstTable.cs
 +++ b/src/Ryujinx.Graphics.Shader/Decoders/InstTable.cs
-@@ -179,6 +179,7 @@
+@@ -179,6 +179,7 @@ namespace Ryujinx.Graphics.Shader.Decoders
              Add("0100110000111xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", InstName.Imul,        InstEmit.ImulC,       InstProps.Rd  | InstProps.Ra);
              Add("00011111xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", InstName.Imul32i,     InstEmit.Imul32i,     InstProps.Rd  | InstProps.Ra);
              Add("11100000xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", InstName.Ipa,         InstEmit.Ipa,         InstProps.Rd  | InstProps.Ra  | InstProps.Rb  | InstProps.Rc);
@@ -262,7 +378,7 @@
              Add("0011100x00011xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", InstName.Iscadd,      InstEmit.IscaddI,     InstProps.Rd  | InstProps.Ra  | InstProps.Ib);
 --- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitAttribute.cs
 +++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitAttribute.cs
-@@ -217,6 +217,71 @@
+@@ -224,6 +224,71 @@ namespace Ryujinx.Graphics.Shader.Instructions
              context.Copy(GetDest(op.Dest), res);
          }
  
@@ -334,9 +450,41 @@
          public static void Isberd(EmitterContext context)
          {
              InstIsberd op = context.GetOp<InstIsberd>();
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitFloatComparison.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitFloatComparison.cs
+@@ -397,6 +397,14 @@ namespace Ryujinx.Graphics.Shader.Instructions
+             srcA = context.FPAbsNeg(srcA, absoluteA, negateA, fpType);
+             srcB = context.FPAbsNeg(srcB, absoluteB, negateB, fpType);
+ 
++            // .FTZ: on NVIDIA a denormal operand compares as zero; the compilers set it on effectively every compare (seedds/nxnative
++            // 84dea6983). Without it a denormal passes "x != 0" and the 1 / x behind that guard overflows into NaN.
++            if (!isFP64)
++            {
++                srcA = context.ConditionalSelect(context.FPCompareLess(context.FPAbsolute(srcA), ConstF(1.17549435E-38f)), ConstF(0f), srcA);
++                srcB = context.ConditionalSelect(context.FPCompareLess(context.FPAbsolute(srcB), ConstF(1.17549435E-38f)), ConstF(0f), srcB);
++            }
++
+             Operand res = GetFPComparison(context, cmpOp, srcA, srcB, fpType);
+             Operand pred = GetPredicate(context, srcPred, srcPredInv);
+ 
+@@ -442,6 +450,14 @@ namespace Ryujinx.Graphics.Shader.Instructions
+             srcA = context.FPAbsNeg(srcA, absoluteA, negateA, fpType);
+             srcB = context.FPAbsNeg(srcB, absoluteB, negateB, fpType);
+ 
++            // .FTZ: on NVIDIA a denormal operand compares as zero; the compilers set it on effectively every compare (seedds/nxnative
++            // 84dea6983). Without it a denormal passes "x != 0" and the 1 / x behind that guard overflows into NaN.
++            if (!isFP64)
++            {
++                srcA = context.ConditionalSelect(context.FPCompareLess(context.FPAbsolute(srcA), ConstF(1.17549435E-38f)), ConstF(0f), srcA);
++                srcB = context.ConditionalSelect(context.FPCompareLess(context.FPAbsolute(srcB), ConstF(1.17549435E-38f)), ConstF(0f), srcB);
++            }
++
+             Operand p0Res = GetFPComparison(context, cmpOp, srcA, srcB, fpType);
+             Operand p1Res = context.BitwiseNot(p0Res);
+             Operand pred = GetPredicate(context, srcPred, srcPredInv);
 --- /dev/null
 +++ b/src/Ryujinx.Graphics.Shader/NxMesh.cs
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,26 @@
 +namespace Ryujinx.Graphics.Shader
 +{
 +    /// <summary>
@@ -354,7 +502,10 @@
 +        [System.ThreadStatic] public static int PayloadWords;  // task payload, 0 for a mesh program without a task
 +
 +        public static bool Active => Threads != 0;
-+        public static int AttributeWords => (MaxVertices + 31) / 32 * Lines.Length * 32;
++        [System.ThreadStatic] public static int[] PrimLines;   // per-primitive output lines, as Lines (only generics and PrimitiveId are used)
++        public static int VertexWords => (MaxVertices + 31) / 32 * Lines.Length * 32;
++        public static int PrimitiveWords => PrimLines == null ? 0 : (MaxPrimitives + 31) / 32 * PrimLines.Length * 32;
++        public static int AttributeWords => VertexWords + PrimitiveWords;   // the vertex region, then the primitive region
 +        public static int MapWords => 4 + 3 * MaxPrimitives;
 +        public static int PayloadBase => AttributeWords + MapWords + 1;
 +        public static int SharedBytes => IsTask ? PayloadWords * 4 : (PayloadBase + PayloadWords) * 4;
@@ -362,7 +513,16 @@
 +}
 --- a/src/Ryujinx.Graphics.Shader/Translation/EmitterContext.cs
 +++ b/src/Ryujinx.Graphics.Shader/Translation/EmitterContext.cs
-@@ -351,6 +351,11 @@
+@@ -83,7 +83,7 @@ namespace Ryujinx.Graphics.Shader.Translation
+ 
+             // Vulkan requires the point size to be always written on the shader if the primitive topology is points.
+             // OpenGL requires the point size to be always written on the shader if PROGRAM_POINT_SIZE is set.
+-            if (TranslatorContext.Definitions.Stage == ShaderStage.Vertex)
++            if (TranslatorContext.Definitions.Stage == ShaderStage.Vertex && !NxMesh.Active)
+             {
+                 // TOTK: the point size is NVN state (SetPointSize), not a translation constant: read it from the support buffer, which the
+                 // host fills per draw. A shader that writes gl_PointSize itself overwrites this store.
+@@ -351,6 +351,11 @@ namespace Ryujinx.Graphics.Shader.Translation
                  return true;
              }
  
@@ -374,9 +534,37 @@
              if (TranslatorContext.Definitions.LastInVertexPipeline &&
                  (TranslatorContext.Definitions.Stage == ShaderStage.Vertex || TranslatorContext.Definitions.Stage == ShaderStage.TessellationEvaluation) &&
                  (TranslatorContext.Options.Flags & TranslationFlags.VertexA) == 0)
+@@ -507,6 +512,13 @@ namespace Ryujinx.Graphics.Shader.Translation
+ 
+                         Operand src = Register(regIndexBase + component, RegisterType.Gpr);
+ 
++                        // LOCAL TEST (Ocarina): a NaN in a colour output spreads through the blur and bloom chains until the whole frame
++                        // is white. Contained here until its source is known. Integer targets carry plain bits.
++                        if (TranslatorContext.Definitions.GetFragmentOutputColorType(rtIndex).HasFlag(AggregateType.FP32))
++                        {
++                            src = this.ConditionalSelect(this.IsNan(src), ConstF(0f), src);
++                        }
++
+                         // Perform B <-> R swap if needed, for BGRA formats (not supported on OpenGL).
+                         if (!supportsBgra && (component == 0 || component == 2))
+                         {
+--- a/src/Ryujinx.Graphics.Shader/Translation/Translator.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Translator.cs
+@@ -187,6 +187,11 @@ namespace Ryujinx.Graphics.Shader.Translation
+ 
+         private static void EmitOutputsInitialization(EmitterContext context, AttributeUsage attributeUsage, IGpuAccessor gpuAccessor, ShaderStage stage)
+         {
++            if (NxMesh.Active)
++            {
++                return;
++            }
++
+             // Compute has no output attributes, so we
+             // don't need to initialize outputs on that stage.
+             if (stage == ShaderStage.Compute)
 --- a/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
 +++ b/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
-@@ -229,7 +229,11 @@
+@@ -241,7 +241,11 @@ namespace Ryujinx.Graphics.Shader.Translation
  
              resourceManager.SetCurrentLocalMemory(_localMemorySize, usesLocalMemory);
  
@@ -391,7 +579,7 @@
  
 --- a/src/Spv.Generator/Module.cs
 +++ b/src/Spv.Generator/Module.cs
-@@ -11,7 +11,26 @@
+@@ -11,7 +11,26 @@ namespace Spv.Generator
          // TODO: Register on SPIR-V registry.
          private const int GeneratorId = 0;
  
@@ -419,136 +607,3 @@
  
          private uint _bound;
  
---- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
-+++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
-@@ -127,7 +127,7 @@
- 
-                 if (decoratedTypes.Add(structType))
-                 {
--                    context.Decorate(structType, isBuffer ? Decoration.BufferBlock : Decoration.Block);
-+                    context.Decorate(structType, isBuffer && !NxMesh.Active ? Decoration.BufferBlock : Decoration.Block);
- 
-                     for (int fieldIndex = 0; fieldIndex < structFieldOffsets.Length; fieldIndex++)
-                     {
-@@ -135,8 +135,10 @@
-                     }
-                 }
- 
--                SpvInstruction pointerType = context.TypePointer(StorageClass.Uniform, structType);
--                SpvInstruction variable = context.Variable(pointerType, StorageClass.Uniform);
-+                // SPIR-V 1.4, needed by mesh stages, has no BufferBlock: storage buffers use their own class there.
-+                StorageClass bufferClass = isBuffer && NxMesh.Active ? StorageClass.StorageBuffer : StorageClass.Uniform;
-+                SpvInstruction pointerType = context.TypePointer(bufferClass, structType);
-+                SpvInstruction variable = context.Variable(pointerType, bufferClass);
- 
-                 context.Name(variable, buffer.Name);
-                 context.Decorate(variable, Decoration.DescriptorSet, (LiteralInteger)setIndex);
---- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
-+++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
-@@ -1716,7 +1716,7 @@
-                         : context.Properties.StorageBuffers[bindingIndex.Value];
-                     StructureField field = buffer.Type.Fields[fieldIndex.Value];
- 
--                    storageClass = StorageClass.Uniform;
-+                    storageClass = storageKind == StorageKind.StorageBuffer && NxMesh.Active ? StorageClass.StorageBuffer : StorageClass.Uniform;
-                     varType = field.Type & AggregateType.ElementTypeMask;
-                     baseObj = storageKind == StorageKind.ConstantBuffer
-                         ? context.ConstantBuffers[bindingIndex.Value]
---- a/src/Ryujinx.Graphics.Shader/Translation/EmitterContext.cs
-+++ b/src/Ryujinx.Graphics.Shader/Translation/EmitterContext.cs
-@@ -83,7 +83,7 @@
- 
-             // Vulkan requires the point size to be always written on the shader if the primitive topology is points.
-             // OpenGL requires the point size to be always written on the shader if PROGRAM_POINT_SIZE is set.
--            if (TranslatorContext.Definitions.Stage == ShaderStage.Vertex)
-+            if (TranslatorContext.Definitions.Stage == ShaderStage.Vertex && !NxMesh.Active)
-             {
-                 // TOTK: the point size is NVN state (SetPointSize), not a translation constant: read it from the support buffer, which the
-                 // host fills per draw. A shader that writes gl_PointSize itself overwrites this store.
---- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
-+++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
-@@ -395,7 +395,10 @@
-                 DeclareInputOrOutput(context, ioDefinition, isOutput, isPerPatch, iq, firstLocation);
-             }
- 
--            DeclarePerVertexBlock(context);
-+            if (!NxMesh.Active)
-+            {
-+                DeclarePerVertexBlock(context);
-+            }
-         }
- 
-         private static void DeclarePerVertexBlock(CodeGenContext context)
---- a/src/Ryujinx.Graphics.Shader/Translation/Translator.cs
-+++ b/src/Ryujinx.Graphics.Shader/Translation/Translator.cs
-@@ -187,6 +187,11 @@
- 
-         private static void EmitOutputsInitialization(EmitterContext context, AttributeUsage attributeUsage, IGpuAccessor gpuAccessor, ShaderStage stage)
-         {
-+            if (NxMesh.Active)
-+            {
-+                return;
-+            }
-+
-             // Compute has no output attributes, so we
-             // don't need to initialize outputs on that stage.
-             if (stage == ShaderStage.Compute)
---- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
-+++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
-@@ -531,7 +531,9 @@
- 
-         private static OperationResult GenerateExponentB2(CodeGenContext context, AstOperation operation)
-         {
--            return GenerateUnary(context, operation, context.Delegates.GlslExp2, null);
-+            // LOCAL TEST (Ocarina): pow(0, c) arrives as exp2(log2(0) * c): exp2(-inf) gives NaN on NVIDIA where the console
-+            // gives 0, and that NaN turned whole frames white. Below 2^-1022 everything is zero in 32 bits anyway.
-+            return GenerateUnary(context, operation, (type, x) => context.Delegates.GlslExp2(type, context.Delegates.GlslFMax(type, x, context.Constant(type, -1022f))), null);
-         }
- 
-         private static OperationResult GenerateFSIBegin(CodeGenContext context, AstOperation operation)
---- a/src/Ryujinx.Graphics.Shader/Translation/EmitterContext.cs
-+++ b/src/Ryujinx.Graphics.Shader/Translation/EmitterContext.cs
-@@ -510,7 +510,14 @@
-                             continue;
-                         }
- 
--                        Operand src = Register(regIndexBase + component, RegisterType.Gpr);
-+                        Operand src = Register(regIndexBase + component, RegisterType.Gpr);
-+
-+                        // LOCAL TEST (Ocarina): a NaN in a colour output spreads through the blur and bloom chains until the whole frame
-+                        // is white. Contained here until its source is known. Integer targets carry plain bits.
-+                        if (TranslatorContext.Definitions.GetFragmentOutputColorType(rtIndex).HasFlag(AggregateType.FP32))
-+                        {
-+                            src = this.ConditionalSelect(this.IsNan(src), ConstF(0f), src);
-+                        }
- 
-                         // Perform B <-> R swap if needed, for BGRA formats (not supported on OpenGL).
-                         if (!supportsBgra && (component == 0 || component == 2))
---- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitFloatComparison.cs
-+++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitFloatComparison.cs
-@@ -398,4 +398,12 @@
-             srcB = context.FPAbsNeg(srcB, absoluteB, negateB, fpType);
-+
-+            // .FTZ: on NVIDIA a denormal operand compares as zero; the compilers set it on effectively every compare (seedds/nxnative
-+            // 84dea6983). Without it a denormal passes "x != 0" and the 1 / x behind that guard overflows into NaN.
-+            if (!isFP64)
-+            {
-+                srcA = context.ConditionalSelect(context.FPCompareLess(context.FPAbsolute(srcA), ConstF(1.17549435E-38f)), ConstF(0f), srcA);
-+                srcB = context.ConditionalSelect(context.FPCompareLess(context.FPAbsolute(srcB), ConstF(1.17549435E-38f)), ConstF(0f), srcB);
-+            }
- 
-             Operand res = GetFPComparison(context, cmpOp, srcA, srcB, fpType);
-             Operand pred = GetPredicate(context, srcPred, srcPredInv);
-@@ -443,4 +451,12 @@
-             srcB = context.FPAbsNeg(srcB, absoluteB, negateB, fpType);
-+
-+            // .FTZ: on NVIDIA a denormal operand compares as zero; the compilers set it on effectively every compare (seedds/nxnative
-+            // 84dea6983). Without it a denormal passes "x != 0" and the 1 / x behind that guard overflows into NaN.
-+            if (!isFP64)
-+            {
-+                srcA = context.ConditionalSelect(context.FPCompareLess(context.FPAbsolute(srcA), ConstF(1.17549435E-38f)), ConstF(0f), srcA);
-+                srcB = context.ConditionalSelect(context.FPCompareLess(context.FPAbsolute(srcB), ConstF(1.17549435E-38f)), ConstF(0f), srcB);
-+            }
- 
-             Operand p0Res = GetFPComparison(context, cmpOp, srcA, srcB, fpType);
-             Operand p1Res = context.BitwiseNot(p0Res);

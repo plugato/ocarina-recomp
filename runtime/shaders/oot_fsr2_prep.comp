@@ -1,0 +1,35 @@
+#version 450
+// LOCAL TEST (Ocarina, OOT_SCENE_FSR2=1): the inputs of AMD FSR 2 (vk_fsr2.cpp) at the render resolution: the colour
+// in linear (the tone map stores its square root) and per-pixel motion vectors from the scene depth and the camera of
+// this frame and the last (oot_motion.c): last frame's position minus this frame's, in UV; and a copy of the depth.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D cur;     // this frame (square root of the colour)
+layout(binding = 1) uniform sampler2D depth;   // this frame's scene depth, 0 near .. 1 far
+layout(binding = 2, rgba16f) uniform writeonly image2D color;
+layout(binding = 3, rg16f) uniform writeonly image2D mv;
+layout(binding = 4, r32f) uniform writeonly image2D dcopy;   // FSR 2 takes its inputs into its own layouts: a copy
+layout(push_constant) uniform P {
+    vec4 m0, m1, m2;   // rows of last view * inverse(this view)
+    vec4 proj;         // P00, P11, linear depth: near / (d * proj.z + proj.w)
+    vec4 size;         // width, height, near, 1 when there is no last camera
+} pc;
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(g, ivec2(pc.size.xy)))) return;
+    const vec3 c = texelFetch(cur, g, 0).rgb;
+    imageStore(color, g, vec4(c * c, 1.0));
+    imageStore(dcopy, g, vec4(texelFetch(depth, g, 0).r));
+    vec2 m = vec2(0.0);
+    if (pc.size.w == 0.0) {
+        const vec2 uv = (vec2(g) + 0.5) / pc.size.xy;
+        const float d = texelFetch(depth, g, 0).r;
+        const float lin = pc.size.z / (d * pc.proj.z + pc.proj.w);
+        const vec4 v = vec4((uv.x * 2.0 - 1.0) * lin / pc.proj.x, (1.0 - uv.y * 2.0) * lin / pc.proj.y, -lin, 1.0);
+        const vec3 q = vec3(dot(pc.m0, v), dot(pc.m1, v), dot(pc.m2, v));
+        if (q.z < -1e-4) {
+            const vec2 pn = vec2(pc.proj.x * q.x, pc.proj.y * q.y) / -q.z;
+            m = vec2(pn.x * 0.5 + 0.5, 0.5 - pn.y * 0.5) - uv;
+        }
+    }
+    imageStore(mv, g, vec4(m, 0.0, 0.0));
+}

@@ -2,7 +2,7 @@
 // decoder (tex_astc.c) would have written, and the native ASTC formats where the device samples them itself.
 //
 // TOTK_ASTC_BC = 1 (gpu mode only, default: by VRAM size): a second pass (runtime/shaders/bc3_encode.comp) encodes the decoded
-// texels to BC3 and the image is BC3, 8 bits per texel instead of 32. Unset: on with 6 GiB of VRAM or less. For GPUs with little video memory, at the cost of
+// texels to BC3 and the image is BC3, 8 bits per texel instead of 32. Unset: on with 12 GiB of VRAM or less. For GPUs with little video memory, at the cost of
 // BC3's quality: textures look slightly blockier, and data textures (normal maps) lose some precision.
 //
 // TOTK_ASTC = auto (default): native when the device reports textureCompressionASTC_LDR and the format's features,
@@ -298,9 +298,11 @@ static int create_pipeline(VkCtx *c) {
 }
 
 // TOTK_ASTC_BC=1: the BC3 encoder, when the device samples BC3 (every desktop GPU does); 0 leaves ASTC as RGBA8.
-// Unset: on when the largest device-local heap is 6 GiB or less. On a GTX 1650 (4 GiB) a new area decoded 940 M
+// Unset: on when the largest device-local heap is 12 GiB or less (6 GiB until an RTX 3060 12 GB lost the device at
+// 12.5 GB of an 11 GB budget, issue #112: from the Kokiri save on an RTX 5090, ASTC as RGBA8 held 6.8 GB of live
+// textures and as BC3 3.3 GB, with the same load stalls and frame rate). On a GTX 1650 (4 GiB) a new area decoded 940 M
 // texels of ASTC into RGBA8 (3.7 GB), the heap reached 6.1 GB of a 3.3 GB budget and the device was lost.
-static int create_bc_pipeline(VkCtx *c) {
+static int bc_wanted(VkCtx *c) {
     const char *e = cfg_get("TOTK_ASTC_BC");
     if (e && *e && *e == '0') return 0;
     if (!e || !*e) {
@@ -308,7 +310,7 @@ static int create_bc_pipeline(VkCtx *c) {
         for (uint32_t h = 0; h < c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
             if (c->mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT && c->mem_props.memoryHeaps[h].size > heap)
                 heap = c->mem_props.memoryHeaps[h].size;
-        if (!heap || heap > (6ull << 30)) return 0;
+        if (!heap || heap > (12ull << 30)) return 0;
         rt_log("vk: %.1f GiB of VRAM: ASTC textures are encoded to BC3 (TOTK_ASTC_BC=0 keeps RGBA8)", (double)heap / (1u << 30));
     }
     VkFormatProperties p;
@@ -318,6 +320,10 @@ static int create_bc_pipeline(VkCtx *c) {
         rt_log("vk: TOTK_ASTC_BC: the device does not sample BC3; ASTC stays RGBA8");
         return 0;
     }
+    return 1;
+}
+static int create_bc_pipeline(VkCtx *c) {
+    if (!bc_wanted(c)) return 0;
     VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof bc3_encode_spv,
                                    .pCode = bc3_encode_spv};
     VkShaderModule m = VK_NULL_HANDLE;
@@ -371,7 +377,9 @@ int vk_astc_mode(void) {
             rt_log("vk: ASTC compute decoder unavailable on %s: ASTC decodes on the CPU", c->props.deviceName);
         }
         if (G.failed && m != VK_ASTC_NATIVE) m = VK_ASTC_CPU;
-        G.bc = m == VK_ASTC_GPU && G.pipe && create_bc_pipeline(c);
+        // The CPU decoder encodes BC3 itself (tex_bc3.c): on an integrated GPU, where it is the default, the memory is
+        // shared and short (a Vega 11 has 1.75 GiB).
+        G.bc = m == VK_ASTC_GPU ? G.pipe && create_bc_pipeline(c) : m == VK_ASTC_CPU && bc_wanted(c);
         G.mode = m;
         rt_log("vk: ASTC textures: %s (textureCompressionASTC_LDR %d)", mode_name(m), native_device(c));
     }
@@ -402,7 +410,8 @@ int vk_astc_gpu(void) {
 
 int vk_astc_bc(void) {
     VkCtx *c = vk_ctx();
-    if (!c || vk_astc_mode() != VK_ASTC_GPU) return 0;
+    int m = c ? vk_astc_mode() : -1;
+    if (m != VK_ASTC_GPU && m != VK_ASTC_CPU) return 0;
     plat_mutex_lock_shared(&g_lock);
     int on = G.dev == c->device && G.bc;
     plat_mutex_unlock_shared(&g_lock);
@@ -471,10 +480,12 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
     VmaAllocationCreateInfo aci = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     VkBuffer sb;
     VmaAllocation sa;
-    if (vmaCreateBuffer(c->vma, &bi, &aci, &sb, &sa, NULL) != VK_SUCCESS) {
+    VkResult scratch = vmaCreateBuffer(c->vma, &bi, &aci, &sb, &sa, NULL);
+    if (scratch != VK_SUCCESS) {
+        vk_texture_vram_short((uint64_t)bi.size);
         if (plat_inc32(&n_fail) <= 16)
-            rt_log("vk: ASTC scratch buffer of %llu bytes failed: texture left undecoded",
-                   (unsigned long long)(cap_in + cap_out));
+            rt_log("vk: ASTC scratch buffer of %llu bytes failed (%d): texture left undecoded for now",
+                   (unsigned long long)bi.size, (int)scratch);
         return 0;
     }
     plat_mutex_lock(&g_lock);

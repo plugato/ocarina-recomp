@@ -1,0 +1,13 @@
+--- a/src/Ryujinx.Graphics.Shader/Translation/Transforms/TexturePass.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Transforms/TexturePass.cs
+@@ -431,7 +431,9 @@
+ 
+             LinkedListNode<INode> oldNode = node;
+ 
+-            if (isGather && !isShadow && hasOffsets)
++            // Depth-compare gathers split too: the path below adds only the first tap's offset to the coordinates,
++            // so all four taps of a shadow gather with per-tap offsets (TLD4.PTP.DC) read the same texel.
++            if (isGather && hasOffsets)
+             {
+                 Operand[] newSources = new Operand[sources.Length];
+ 

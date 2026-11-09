@@ -1,0 +1,54 @@
+#version 450
+// LOCAL TEST (Ocarina): temporal anti-aliasing of the scene before the stand-in upscale (vk_exec_draw.c
+// big_compute_blit). The tone map's output is the square root of the colour; it is accumulated in that space. Each
+// pixel is reprojected into the last frame through the scene depth and the camera of both frames (oot_motion.c), the
+// history there is clamped to the current 3x3 neighbourhood (a wrong or missing vector, as on Link or moving foliage,
+// leaves a one-frame trace at most) and blended in; a pixel the last frame did not see takes the current colour.
+// After the idea of the Linux port's "FSR 3 temporal" mode (oot_temporal.comp), with the camera's vectors in place of
+// image-estimated ones.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D cur;     // this frame (square root of the colour)
+layout(binding = 1) uniform sampler2D depth;   // this frame's scene depth, 0 near .. 1 far
+layout(binding = 2) uniform sampler2D hist;    // the last accumulated frame
+layout(binding = 3, rgba16f) uniform writeonly image2D dst;
+layout(push_constant) uniform P {
+    vec4 m0, m1, m2;   // rows of last view * inverse(this view)
+    vec4 proj;         // P00, P11, linear depth: near / (d * proj.z + proj.w)
+    vec4 size;         // width, height, near, 1 when there is no history
+    vec4 misc;         // x: weight of this frame (0..1)
+} pc;
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 sz = ivec2(pc.size.xy);
+    if (any(greaterThanEqual(g, sz))) return;
+    const vec3 c = texelFetch(cur, g, 0).rgb;
+    if (pc.size.w != 0.0) { imageStore(dst, g, vec4(c, 1.0)); return; }
+    vec3 lo = c, hi = c;
+    for (int i = 0; i < 9; i++) {
+        const vec3 s = texelFetch(cur, clamp(g + ivec2(i % 3 - 1, i / 3 - 1), ivec2(0), sz - 1), 0).rgb;
+        lo = min(lo, s), hi = max(hi, s);
+    }
+    const vec2 uv = (vec2(g) + 0.5) / pc.size.xy;
+    const float d = texelFetch(depth, g, 0).r;
+    const float lin = pc.size.z / (d * pc.proj.z + pc.proj.w);
+    const vec4 v = vec4((uv.x * 2.0 - 1.0) * lin / pc.proj.x, (1.0 - uv.y * 2.0) * lin / pc.proj.y, -lin, 1.0);
+    const vec3 q = vec3(dot(pc.m0, v), dot(pc.m1, v), dot(pc.m2, v));
+    float a = pc.misc.x;
+    vec3 o = c;
+    if (q.z < -1e-4) {
+        const vec2 pn = vec2(pc.proj.x * q.x, pc.proj.y * q.y) / -q.z;
+        const vec2 puv = vec2(pn.x * 0.5 + 0.5, 0.5 - pn.y * 0.5);
+        if (all(greaterThanEqual(puv, vec2(0.0))) && all(lessThanEqual(puv, vec2(1.0)))) {
+            const vec3 raw = textureLod(hist, puv, 0.0).rgb;
+            const vec3 old = clamp(raw, lo, hi);
+            // a longer vector blurs the resampled history more: lean to this frame
+            a = clamp(a + 0.002 * length((uv - puv) * pc.size.xy), a, 0.8);
+            // a pixel far from its history is something the camera's vectors do not move (Navi's wings, Link): this
+            // frame's, else a moving thin object fades into the background behind it; edge shimmer stays below this
+            const vec3 dd = abs(c - raw);
+            a = mix(a, 1.0, smoothstep(0.05, 0.15, max(dd.r, max(dd.g, dd.b))));
+            o = mix(old, c, a);
+        }
+    }
+    imageStore(dst, g, vec4(o, 1.0));
+}

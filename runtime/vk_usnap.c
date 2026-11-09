@@ -289,6 +289,11 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
     return 1;
 }
 
+// The snapshot copy's bytes behind a vk_usnap_find hit, NULL otherwise (vk_exec_draw.c oot_tonemap_exposure).
+uint8_t *vk_usnap_map(const VkDescriptorBufferInfo *bi) {
+    return U.on && U.arena && bi->buffer == U.arena->buf ? U.arena->map + bi->offset : NULL;
+}
+
 void vk_usnap_drop(uint64_t addr, uint64_t n) {
     if (!U.mode || !n) return;
     if (U.nwr == U.cwr) U.wr = grow(U.wr, &U.cwr, sizeof *U.wr);

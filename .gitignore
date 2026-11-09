@@ -80,3 +80,6 @@ desktop.ini
 
 # the shader preparation seed: bundled into the setup ZIP by tools/oot/make_setup.py --seed, never committed
 tools/data/oot-seed/
+
+# LOCAL TEST (Ocarina): the input jogar\jogar-perfil-gpu.ps1 records
+/entrada-gravada.txt

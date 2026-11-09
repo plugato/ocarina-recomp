@@ -393,6 +393,17 @@ static void ov_vib_mounted(Cpu *c) {
     ret_x(c, 0);
 }
 
+// bool IsOunceVibrationDeviceMounted(const VibrationDeviceHandle &) and Result detail::IsOunceVibrationDeviceMounted(
+// bool *out, const VibrationDeviceHandle &): the Switch 2 query. Without them the SDK opened the "hid" service and
+// the game stopped (FATAL: sm: service "hid" is not implemented, an RTX 3070 player). Answered as the classic one.
+static void ov_vib_ounce_mounted(Cpu *c) { ret_x(c, vibration_side(arg_p(c, 0), "IsOunceVibrationDeviceMounted") >= 0); }
+static void ov_vib_ounce_mounted_detail(Cpu *c) {
+    uint8_t *out = arg_p(c, 0);
+    if (!out) rt_fatal("nn::hid::detail::IsOunceVibrationDeviceMounted: null output");
+    *out = vibration_side(arg_p(c, 1), "IsOunceVibrationDeviceMounted") >= 0;
+    ret_x(c, 0);
+}
+
 // Result detail::IsVibrationPermitted(bool *out)
 static void ov_vib_permitted(Cpu *c) {
     uint8_t *out = arg_p(c, 0);
@@ -548,6 +559,9 @@ HOST_OVERRIDE("_ZN2nn3hid6detail22GetVibrationDeviceInfoEPNS0_19VibrationDeviceI
               ov_vib_info);
 HOST_OVERRIDE("_ZN2nn3hid6detail24IsVibrationDeviceMountedEPbRKNS0_21VibrationDeviceHandleE", ov_vib_mounted);
 HOST_OVERRIDE("_ZN2nn3hid6detail20IsVibrationPermittedEPb", ov_vib_permitted);
+HOST_OVERRIDE("_ZN2nn3hid29IsOunceVibrationDeviceMountedERKNS0_21VibrationDeviceHandleE", ov_vib_ounce_mounted);
+HOST_OVERRIDE("_ZN2nn3hid6detail29IsOunceVibrationDeviceMountedEPbRKNS0_21VibrationDeviceHandleE",
+              ov_vib_ounce_mounted_detail);
 HOST_OVERRIDE("_ZN2nn3hid6detail15PermitVibrationEb", ov_vib_permit);
 HOST_OVERRIDE("_ZN2nn3hid6detail18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", ov_six_start);
 HOST_OVERRIDE("_ZN2nn3hid6detail17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", ov_six_stop);

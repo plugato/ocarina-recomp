@@ -361,6 +361,23 @@ class CandidateTest(unittest.TestCase):
         self.assertEqual(guarded_memory_blocks((args.out / 'atomic.spv').read_bytes(),
                                               {x['binding'] for x in res['sbufs']}), 3)
 
+    def test_float_atomic_add_reads_each_try_atomically(self):
+        # ATOM.ADD.F32.FTZ.RN.E R2,[R0],R6: a compare-and-swap loop whose reads are atomic (OR 0), not plain loads
+        # an AMD driver may serve stale or hoist out of the loop (patch 0037).
+        ops = original.instructions(True)
+        load = ops.index(original.global_memory(False, 2, 0))
+        atomic = 0xED00000000000000 | (3 << 49) | (1 << 48) | (6 << 20) | original.PT | 2
+        ops[load:load + 1] = [original.movi(6, 0x3F80), atomic]
+        self.translate([packet('atomic_f32', encoded(ops), storage_candidates_version=1)])
+        data = (args.out / 'atomic_f32.spv').read_bytes()
+        words = struct.unpack('<%dI' % (len(data) // 4), data)
+        opcodes, i = [], 5
+        while i < len(words):
+            opcodes.append(words[i] & 0xFFFF)
+            i += words[i] >> 16
+        self.assertIn(230, opcodes)   # OpAtomicCompareExchange
+        self.assertIn(241, opcodes)   # OpAtomicOr, the read of each try
+
     def test_descriptor_limit_rejects_instead_of_truncating(self):
         jobs = []
         for count in (31, 32):

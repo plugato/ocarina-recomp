@@ -256,6 +256,23 @@ static VkPresentModeKHR pick_present_mode(VkPhysicalDevice pd) {
 
 const char *gfx_window_present_mode(void) { return __atomic_load_n(&g_present_got, __ATOMIC_ACQUIRE); }
 
+// TOTK_PRESENT_FENCE (default 1 on AMD, 0 elsewhere): the present waits for its blit's fence on the CPU and passes the
+// driver no wait semaphore; the blit then signals none. AMD's Windows driver (amdvlk64 26.10.1, RX 5500 XT) spun
+// forever inside vkQueuePresentKHR (IcdPresentBuffers polls a slot that stays -1) with the blit done and the GPU idle,
+// always while the opening movie played: the picture froze black. g_fence[slot] already guards the blit's command buffer.
+// Tested: docs/test-environment-rx5500xt.md.
+static int present_fence(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("TOTK_PRESENT_FENCE");
+        on = e && *e ? strcmp(e, "0") != 0 : vk_caps.amd_sc;
+        rt_log("gfx: the present %s (TOTK_PRESENT_FENCE=%d)",
+               on ? "waits for its blit's fence, no wait semaphore" : "waits on the blit's semaphore", on);
+    }
+    return on;
+}
+static unsigned g_flip_slot;   // the fence slot of the blit g_flip_idx waits for
+
 // Queues the present of a blit vk_present_blit left waiting (g_pl held). A swapchain rebuild and the next blit flush it
 // first; the device release drops it.
 static void flip_locked(void) {
@@ -265,9 +282,19 @@ static void flip_locked(void) {
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
                            .pWaitSemaphores = &g_render_done[g_flip_idx], .swapchainCount = 1, .pSwapchains = &g_sc,
                            .pImageIndices = &g_flip_idx};
-    vk_queue_lock();
-    VkResult r = vkQueuePresentKHR(vk_ctx()->gfx_queue, &pi);
-    vk_queue_unlock();
+    VkCtx *c = vk_ctx();
+    if (present_fence()) {
+        if (vkWaitForFences(c->device, 1, &g_fence[g_flip_slot], VK_TRUE, 5000000000ull) != VK_SUCCESS)
+            rt_log("gfx: present: the blit's fence wait timed out");
+        pi.waitSemaphoreCount = 0;
+        pi.pWaitSemaphores = NULL;
+    }
+    // Its own present queue (vk.h present_queue) is used only here, under g_pl: the game's submissions go on while the
+    // driver holds this call. On the graphics queue, the queue lock as for any other use of it.
+    int shared = c->present_queue == c->gfx_queue;
+    if (shared) vk_queue_lock();
+    VkResult r = vkQueuePresentKHR(c->present_queue, &pi);
+    if (shared) vk_queue_unlock();
     vk_device_fault_report(r);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
 }
@@ -728,7 +755,8 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     VkCommandBufferSubmitInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb};
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = 1, .pWaitSemaphoreInfos = &wait,
-                        .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = 1,
+                        .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi,
+                        .signalSemaphoreInfoCount = present_fence() ? 0u : 1u,   // flip_locked waits for the fence instead
                         .pSignalSemaphoreInfos = &sig};
     vk_queue_lock();
     r = vkQueueSubmit2(c->gfx_queue, 1, &si, g_fence[slot]);
@@ -737,6 +765,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         g_ts_on[slot] = (uint8_t)timed;
         g_flip_on = 1;
         g_flip_idx = idx;
+        g_flip_slot = slot;
         if (!defer) flip_locked();
     } else {
         vk_device_fault_report(r);
@@ -788,6 +817,7 @@ void gfx_window_release_vk(void) {
         g_flip_on = 0;   // its blit is done (device idle); the swapchain goes away unpresented
         menu_vk_release();
         vk_fsr_release();
+        vk_framegen_release();
         vk_color_release();
         free_capture();
         free_thumbs();

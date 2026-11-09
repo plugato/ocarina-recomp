@@ -28,7 +28,7 @@ static const uint8_t dims[14][2] = {{4, 4}, {5, 4}, {5, 5}, {6, 5}, {6, 6}, {8, 
 // Buckets of valid blocks: partitions 1-4 single plane, then dual plane with 1-3 partitions.
 enum { NB = 7, PER_BUCKET = 48 };
 static const char *const bucket_name[NB] = {"1p", "2p", "3p", "4p", "dual 1p", "dual 2p", "dual 3p"};
-static uint64_t g_bucket[NB], g_void, g_err, g_blocks, g_texels, g_bc_cases;
+static uint64_t g_bucket[NB], g_void, g_err, g_blocks, g_texels, g_bc_cases, g_bc_cpu_cases;
 static double g_bc_db = 99;   // the lowest BC3 PSNR of all cases
 
 static int dual_bit(uint32_t m) {
@@ -321,6 +321,17 @@ static int test_case(VkCtx *c, uint32_t bw, uint32_t bh, int srgb) {
         g_bc_cases += !bad;
         free(bc);
     }
+    if (!bad) {   // the CPU encoder (tex_bc3.c, ASTC decoded on the CPU) under the same check, on every device
+        size_t b0 = (size_t)((w0 + 3) / 4) * ((h0 + 3) / 4) * 16, b1 = (size_t)((w1 + 3) / 4) * ((h1 + 3) / 4) * 16;
+        uint8_t *bc = malloc(b0 + b1);
+        char what[2][48];
+        double db[2] = {0, 0};
+        for (int lv = 0; lv < 2; lv++) snprintf(what[lv], sizeof what[lv], "CPU %ux%u %s level %d", bw, bh, srgb ? "sRGB" : "linear", lv);
+        bc3_encode(want, w0, h0, bc), bc3_encode(want + t0 * 4, w1, h1, bc + b0);
+        bad = bc_check(want, bc, w0, h0, what[0], &db[0]) || bc_check(want + t0 * 4, bc + b0, w1, h1, what[1], &db[1]);
+        g_bc_cpu_cases += !bad;
+        free(bc);
+    }
     g_blocks += n0 + n1, g_texels += t0 + t1;
     free(blk), free(want), free(rb), free(im);
     return bad;
@@ -372,6 +383,7 @@ int probe_astc(void) {
     if (!bad && !vk_astc_bc()) printf("probe-astc: BC3 encoder not available on this device: not checked\n");
     else if (!bad) printf("probe-astc: BC3 encode: %llu cases within the bounds, lowest PSNR %.1f dB (floor %d)\n",
                           (unsigned long long)g_bc_cases, g_bc_db, BC_MIN_DB);
+    if (!bad) printf("probe-astc: CPU BC3 encode (tex_bc3.c): %llu cases within the bounds\n", (unsigned long long)g_bc_cpu_cases);
     if (!bad) {
         timing(c, 4, 4);
         timing(c, 6, 6);

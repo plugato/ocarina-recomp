@@ -1,0 +1,25 @@
+--- a/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
+@@ -160,8 +160,20 @@ namespace Ryujinx.Graphics.Shader.Translation
+ 
+         internal int GetDepthRegister()
+         {
+-            // The depth register is always two registers after the last color output.
+-            return BitOperations.PopCount((uint)Definitions.OmapTargets) + 1;
++            // The colours are read four registers per render target with any component enabled (component c of
++            // the n-th such target in R(4n + c), EmitterContext), then the sample mask, then the depth. Counting
++            // enabled components agreed only when every enabled target has all four: Ocarina's OmapTargets 0x10f
++            // (RT0 RGBA, RT2 R) wrote R6 as depth instead of R9 (nxnative docs/reference/shaders.md).
++            int targets = 0;
++            for (int rt = 0; rt < 8; rt++)
++            {
++                if ((Definitions.OmapTargets & (0xf << (rt * 4))) != 0)
++                {
++                    targets++;
++                }
++            }
++
++            return targets * 4 + 1;
+         }
+ 
+         public void SetLayerOutputAttribute(int attr)

@@ -41,6 +41,13 @@ bool astc_decode_block(const uint8_t block[16], uint32_t bw, uint32_t bh, bool s
 // tex_astc_mt.c: the same bytes as astc_decode_ldr, large images split by block rows over a worker pool; blocks.
 void astc_decode_ldr_mt(const uint8_t *blocks, uint32_t width, uint32_t height, uint32_t bw, uint32_t bh, bool srgb,
                         uint8_t *rgba_out);
+// tex_bc3.c: RGBA8 to BC3 on the CPU (ASTC decoded on the CPU when ASTC is BC3, vk_astc_bc). out: ceil(w/4) x ceil(h/4)
+// blocks of 16 bytes.
+void bc3_encode_block(const uint8_t px[64], uint8_t out[16]);
+void bc3_encode(const uint8_t *rgba, uint32_t width, uint32_t height, uint8_t *out);
+void bc3_encode_rows(const uint8_t *rgba, uint32_t width, uint32_t height, uint32_t j0, uint32_t j1, uint8_t *out);
+// tex_astc_mt.c: bc3_encode over the ASTC decode workers (the same bytes).
+void bc3_encode_mt(const uint8_t *rgba, uint32_t width, uint32_t height, uint8_t *out);
 
 // ---- vk_formats.c (LAS Recomp runtime/nvn/vulkan/textures.c format table, MIT) ----
 typedef struct TexVkFormat {

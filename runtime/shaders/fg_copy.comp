@@ -1,0 +1,14 @@
+#version 450
+// Frame interpolation (vk_framegen.c), ported from NotRexed/Hookshot gpu/vk/shaders (GPL-3.0, as this repository).
+// The game's frame (its crop of the window texture), read through a view of its own format, copied: the next frame
+// may be drawn over it. Ocarina's window texture is UNORM holding display values, the values the thresholds of
+// fg_synth.comp were tuned on.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, rgba16f) uniform writeonly image2D dst;
+layout(push_constant) uniform P { ivec2 offset; ivec2 size; } pc;
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(g, pc.size))) return;
+    imageStore(dst, g, vec4(texelFetch(src, g + pc.offset, 0).rgb, 1.0));
+}

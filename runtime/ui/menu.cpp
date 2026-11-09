@@ -253,6 +253,15 @@ static void vk_down(void) {
     g_font_scale = 0;
 }
 
+// The back end reports every Vulkan result here. A failed allocation skips the overlay for a frame instead of ending the
+// game (imgui_impl_vulkan.cpp), and this line says that it happened.
+// Tested: docs/test-environment-rx5500xt.md.
+static void menu_vk_check(VkResult r) {
+    static std::atomic<int> told;
+    if (r != VK_SUCCESS && told.fetch_add(1, std::memory_order_relaxed) < 16)
+        rt_log("menu: a Vulkan call of the overlay failed (%d): its frame is skipped", (int)r);
+}
+
 static int vk_up(const MenuTarget *t) {
     if (g_vk_ok && g_vk_fmt == t->format) return 1;
     if (g_vk_ok) {   // the swapchain changed format: pipelines for the new one
@@ -272,6 +281,10 @@ static int vk_up(const MenuTarget *t) {
     ii.MinImageCount = 2;
     ii.ImageCount = 4;   // vertex buffers rotate per recorded frame: more than gfx_present.c's 2 frames in flight
     ii.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+    ii.CheckVkResultFn = menu_vk_check;
+    // Room for the whole menu from the first overlay frame, while memory is free: opening it deep into a scene that has
+    // filled the GPU memory then needs no new buffer (2 MiB of vertices is several times what the menu draws).
+    ii.MinAllocationSize = 2u << 20;
     ii.UseDynamicRendering = true;
     g_vk_fmt = t->format;
     ii.PipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
@@ -599,6 +612,56 @@ static const char *present_note(void) {
     return note;
 }
 
+// Quality preset: writes the render scale, scene upscaling, frame generation, texture compression and sharpness
+// together; Auto picks a tier by the GPU's memory, frame generation follows the monitor's refresh rate. Changing one of
+// those rows by hand makes the preset Custom (the default: a player's own settings stay as they are).
+static float g_vram_mib;   // device-local memory of the GPU in use (menu_gpu_info), 0 before it is known
+struct QualityTier { const char *scale, *scene, *astc_bc, *sharp; int fg_max; };
+static const QualityTier *quality_tier(const char *p) {
+    static const QualityTier low = {"67", "easu", "1", "80", 1}, medium = {"game", "easu", "1", "80", 1},
+                             high = {"game", "fsr2", "", "50", 2}, ultra = {"100", "fsr2", "", "50", 4};
+    if (!strcmp(p, "auto")) {
+        float gib = g_vram_mib / 1024.0f;
+        p = gib <= 0 ? "medium" : gib <= 6.5f ? "low" : gib <= 8.5f ? "medium" : gib <= 12.5f ? "high" : "ultra";
+    }
+    return !strcmp(p, "low") ? &low : !strcmp(p, "medium") ? &medium : !strcmp(p, "high") ? &high
+                                    : !strcmp(p, "ultra") ? &ultra : nullptr;
+}
+static int quality_fg(const QualityTier *t) {   // the most frames per game frame the monitor can show at about 60 fps
+    double hz = gfx_window_refresh_hz();
+    int fg = hz >= 200 ? 4 : hz >= 150 ? 3 : hz >= 100 ? 2 : 1;
+    return fg < t->fg_max ? fg : t->fg_max;
+}
+static bool quality_matches(const QualityTier *t) {
+    char fg[8];
+    snprintf(fg, sizeof fg, "%d", quality_fg(t));
+    return !strcmp(cfg_value("TOTK_RENDER_SCALE"), t->scale) && !strcmp(cfg_value("TOTK_SCENE_UPSCALER"), t->scene) &&
+           !strcmp(cfg_value("TOTK_ASTC_BC"), t->astc_bc) && !strcmp(cfg_value("TOTK_SHARPNESS"), t->sharp) &&
+           !strcmp(cfg_value("TOTK_FRAMEGEN"), fg);
+}
+static void rows_quality(void) {
+    static const UiTextId names[] = {UI_MENU_QUALITY_CUSTOM, UI_MENU_QUALITY_AUTO, UI_MENU_QUALITY_LOW,
+                                     UI_MENU_QUALITY_MEDIUM, UI_MENU_QUALITY_HIGH, UI_MENU_QUALITY_ULTRA};
+    if (opt_choice("TOTK_QUALITY_PRESET", UI_MENU_QUALITY, names, 6, UI_MENU_QUALITY_DESC)) {
+        const QualityTier *t = quality_tier(cfg_value("TOTK_QUALITY_PRESET"));
+        if (t) {
+            char fg[8];
+            snprintf(fg, sizeof fg, "%d", quality_fg(t));
+            cfg_set("TOTK_RENDER_SCALE", t->scale), cfg_set("TOTK_SCENE_UPSCALER", t->scene);
+            cfg_set("TOTK_ASTC_BC", t->astc_bc), cfg_set("TOTK_SHARPNESS", t->sharp), cfg_set("TOTK_FRAMEGEN", fg);
+            cfg_save();
+        }
+    }
+}
+// After the rows a preset sets: one moved by hand makes the preset Custom.
+static void quality_check(void) {
+    const QualityTier *t = quality_tier(cfg_value("TOTK_QUALITY_PRESET"));
+    if (t && !quality_matches(t)) {
+        cfg_set("TOTK_QUALITY_PRESET", "custom");
+        cfg_save();
+    }
+}
+
 // ---- the tabs
 // Colour adjustment (vk_color.c): a profile writes the four values (STS78721's presets, issue #136); moving one of them
 // makes the profile Custom.
@@ -639,11 +702,21 @@ static void tab_screen(float scale) {
     static const UiTextId perf[] = {UI_MENU_PERF_OFF, UI_MENU_PERF_FPS, UI_MENU_PERF_FULL};
     opt_choice("TOTK_PERF_OVERLAY", UI_MENU_PERF_OVERLAY, perf, 3, UI_MENU_PERF_OVERLAY_DESC);
     opt_group(UI_MENU_GRAPHICS);
+    rows_quality();
     row_output_res();
     row_render_scale();
     static const UiTextId up[] = {UI_MENU_UPSCALER_FSR, UI_MENU_UPSCALER_BILINEAR};
     opt_choice("TOTK_UPSCALER", UI_MENU_UPSCALER, up, 2, UI_MENU_UPSCALER_DESC);
     opt_slider("TOTK_SHARPNESS", UI_MENU_SHARPNESS, 0, 100, UI_MENU_SHARPNESS_DESC, 5, "%.0f %%");
+    static const UiTextId scene[] = {UI_MENU_SCENE_UP_EASU, UI_MENU_SCENE_UP_BILINEAR, UI_MENU_SCENE_UP_TAA,
+                                     UI_MENU_SCENE_UP_FSR2};
+    opt_choice("TOTK_SCENE_UPSCALER", UI_MENU_SCENE_UP, scene, 4, UI_MENU_SCENE_UP_DESC);
+    {
+        static const char *const vals[] = {"1", "2", "3", "4"};
+        const char *names[] = {menu_text(UI_MENU_FRAMEGEN_OFF), "2x", "3x", "4x"};
+        opt_choice_list("TOTK_FRAMEGEN", UI_MENU_FRAMEGEN, vals, names, 4, UI_MENU_FRAMEGEN_DESC);
+    }
+    quality_check();
     static const UiTextId aspect[] = {UI_MENU_ASPECT_FIT, UI_MENU_ASPECT_STRETCH};
     opt_choice("TOTK_ASPECT", UI_MENU_ASPECT, aspect, 2, UI_MENU_ASPECT_DESC);
     opt_slider("TOTK_FOV", UI_MENU_FOV, 70, 140, UI_MENU_FOV_DESC, 5, "%.0f %%");
@@ -995,6 +1068,7 @@ static void perf_gpu_once(const MenuTarget *t) {
         if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) vram += mp.memoryHeaps[h].size;
     perfmon_set_gpu(p2.properties.deviceName, id.deviceLUIDValid ? id.deviceLUID : NULL, has_bus ? (int)bus.pciBus : -1,
                     (float)(vram >> 20));
+    g_vram_mib = (float)(vram >> 20);
 }
 
 static void perf_tick(uint64_t now, const MenuTarget *t) {

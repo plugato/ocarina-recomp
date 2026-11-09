@@ -23,6 +23,11 @@ typedef struct VkCtx {
     uint32_t gfx_family;                    // graphics + compute + presentation on win32
     uint32_t xfer_family;                   // a transfer-only family when the GPU has one, else gfx_family
     VkQueue gfx_queue;                      // graphics + present
+    // A second queue of gfx_family only for vkQueuePresentKHR, synchronised by the present lock (gfx_present.c g_pl)
+    // instead of vk_queue_lock: AMD's Windows driver can block inside the present while presents are queued ahead of
+    // the display, and with the queue lock held there the game's next submission waited forever (frozen picture).
+    // Only on that driver unless TOTK_PRESENT_QUEUE=1; equals gfx_queue otherwise, and when the family has one queue.
+    VkQueue present_queue;
     VkQueue xfer_queue;                     // equals gfx_queue when xfer_shared
     int xfer_shared;                        // 1: no separate queue; serialise with gfx_queue
     VmaAllocator vma;
@@ -103,6 +108,21 @@ void vk_present_blit(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int
 int vk_fsr_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, int sw, int sh, const int crop[4],
                   VkImage dst, const int out[4]);
 void vk_fsr_release(void);   // before the device goes away
+// vk_framegen.c: frame interpolation (TOTK_FRAMEGEN). vk_framegen_make records and submits the made frames between the
+// last game frame and src (its crop): their images (RGBA16F, GENERAL, ow x oh) go to out[], their count is returned (0:
+// none this frame, the game's frame is shown alone).
+int vk_framegen_mult(void);
+// oot_motion.c: a frame's camera (view rows x, y, z; P00, P11; linear depth = near_ / (d * lin_y + lin_x)) and its
+// scene depth (R32F, GENERAL, w x h), for vk_framegen_make's camera vectors.
+typedef struct { float view[12], p00, p11, lin_x, lin_y, near_; VkImageView depth; uint32_t w, h; } OotMotionFrame;
+int oot_motion_take(OotMotionFrame *out);
+int oot_motion_peek(OotMotionFrame *out, uint64_t *seq);
+int oot_motion_scene_taa(void);
+void oot_motion_delta(const float *last, const float *cur, float m[12]);   // rows of last view * inverse(this view)
+int vk_framegen_make(VkImage src, VkFormat fmt, int sw, int sh, const int crop[4], const OotMotionFrame *mo, VkImage out[],
+                     int *ow, int *oh);
+VkFormat vk_framegen_format(void);
+void vk_framegen_release(void);
 // Colour adjustment on the present (vk_color.c): with TOTK_COLOR_* away from their defaults, records a pass that writes
 // src's crop rectangle {x, y, w, h}, adjusted, into an RGBA16F image of that size in GENERAL and returns it (the caller
 // scales that one instead, crop {0, 0, w, h}); VK_NULL_HANDLE = nothing recorded. src is in GENERAL, fmt its format.
@@ -151,6 +171,7 @@ void vk_guest_written(uint64_t addr, uint64_t size);   // a host write write-wat
 typedef struct {
     VkBuffer buffer;
     VkDeviceSize offset, avail;
+    uint64_t guest_offset, guest_size;   // imported pools: the request's offset from import_lo and size (partial mirror)
     VmaAllocation alloc;
     VkDeviceSize alloc_offset;
     int cls;
@@ -218,6 +239,7 @@ void vk_mem_gpu_wrote_shader(const VkMemSpan *sp, uint64_t size);
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence);
 void vk_usnap_end(uint64_t fence);
 int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out);
+uint8_t *vk_usnap_map(const VkDescriptorBufferInfo *bi);   // the snapshot copy's bytes behind a vk_usnap_find hit, NULL otherwise
 void vk_usnap_drop(uint64_t addr, uint64_t n);   // the replay makes the GPU write [addr, addr+n) of guest memory
 uint64_t vk_usnap_gen(void);                      // changes whenever a binding may resolve differently
 void vk_usnap_shutdown(void);                     // vk_exec_draw_shutdown: frees the arenas
@@ -242,6 +264,7 @@ void vk_mem_census(uint64_t frame);               // at each present: pool censu
 // VRAM in use and its budget, summed over the DEVICE_LOCAL heaps. exact 1: VK_EXT_memory_budget (the whole process),
 // 0: this allocator's own allocations against the heap sizes. 0 when unknown.
 int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact);
+uint64_t vk_mem_target_bytes(void);   // TOTK_VRAM_TARGET_MIB: budget used by texture pressure and mirrors (0 = driver budget)
 // VRAM headroom (vk_headroom.c): the VMA callbacks that see new device memory, and the thread that allocates the next
 // block of each memory type in use ahead of the render thread.
 const VmaDeviceMemoryCallbacks *vk_headroom_callbacks(void);
@@ -287,7 +310,8 @@ enum { VK_ASTC_CPU, VK_ASTC_GPU, VK_ASTC_NATIVE, VK_ASTC_CHECK };
 int vk_astc_mode(void);                 // decided once per device (logged); VK_ASTC_CPU before vk_init
 int vk_astc_native(VkFormat astc_fmt);  // 1: images of this ASTC format are created as such and get the raw blocks
 int vk_astc_gpu(void);                  // 1: ASTC images decoded to RGBA8 by the compute decoder (vk_astc_record)
-int vk_astc_bc(void);                   // 1: those images are BC3 instead, encoded after the decode (TOTK_ASTC_BC=1)
+int vk_astc_bc(void);                   // 1: those images are BC instead, encoded after the decode (TOTK_ASTC_BC=1)
+int vk_astc_bc1(void);                  // 1: the BC1 encoder is available (ASTC source >=5x5 uses it)
 // One image region decoded from raw blocks: tight rows of 16-byte blocks at byte src of the source buffer (slices one
 // after the other), w x h texels and slices deep, written at offset of level / layer.
 typedef struct { VkDeviceSize src; uint32_t w, h, slices, level, layer; VkOffset3D offset; } VkAstcRegion;
@@ -295,7 +319,8 @@ typedef struct { VkDeviceSize src; uint32_t w, h, slices, level, layer; VkOffset
 // bytes of blocks) goes to a device-local scratch buffer, a dispatch per region decodes it, and the texels are copied
 // into img (VK_IMAGE_LAYOUT_GENERAL). The caller records its usual barriers around an image copy before and after the
 // call. readback (optional, host-visible, TRANSFER_DST): also gets the decoded texels, the regions one after the other.
-// bc: img is BC3 (TexVkFormat.astc_bc); the texels are encoded to BC3 blocks before the copy, and readback is ignored.
+// bc: 1 = img is BC3, 2 = img is BC1 (TexVkFormat.astc_bc/astc_bc1); the texels are encoded to blocks before the
+// copy, and readback is ignored.
 // 0 when the decoder is unavailable or the scratch buffer cannot be allocated (nothing recorded).
 int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, const VkAstcRegion *rg, int n, uint32_t bw,
                    uint32_t bh, int srgb, int bc, VkImage img, VkImageAspectFlags aspect, VkBuffer readback);
@@ -379,8 +404,10 @@ void vk_texture_stats(uint64_t *images, uint64_t *uploads, uint64_t *reuploads);
 typedef struct { uint64_t live, released, own_live, own_released, bytes_live, bytes_released; } VkTexCensus;
 void vk_texture_census(VkTexCensus *s);
 void vk_texture_released_log(uint64_t frame);       // mem: released lines of vram_log
+
 void vk_texture_shutdown(void);                     // vk_mem_shutdown calls it
 void vk_texture_new_submit(void);                   // a queue submit starts: draw bindings check storage again
+void vk_texture_vram_short(uint64_t bytes);         // an allocation failed: old released textures go at the next submit
 uint32_t vk_texture_epoch(void);                    // the write-watch snapshot epoch vk_texture_new_submit started
 VkSampler vk_sampler_by_id(const dpool_ref *pool, int id);
 VkSampler vk_sampler_for(const samp_par *s);        // cached by content
@@ -529,6 +556,7 @@ int vk_pipeline_async_on(void);   // 1 after vk_pipeline_async_enable: graphics 
 void vk_pipeline_prewarm(void);
 VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info);
 int vk_pipeline_compute_ready(const GfxShader *cs);   // LOCAL TEST (Ocarina): 0 while a big compute shader builds in the background
+void vk_pipeline_big_cs_met(const GfxShader *cs, uint64_t origin);   // LOCAL TEST (Ocarina): lists it for --warm-big-cs
 // Records every dynamic state that VkPipeState determines, after binding a graphics pipeline: cull mode, front face,
 // topology, depth and stencil tests and ops, depth bias enable, rasterizer discard, vertex input, and, where the GPU
 // has them dynamic, depth clamp, polygon mode, blend enables, equations, write masks and alpha to coverage. The replay

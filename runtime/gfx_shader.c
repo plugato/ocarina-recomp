@@ -1605,6 +1605,14 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
         uint16_t m[4];
         memcpy(m, control + NVN2_C0_LAYOUT + 4, sizeof m);
         o += sprintf(o, ",\"mesh\":[%u,%u,%u,%u]", m[0], m[1], m[2], m[3]);
+        const uint8_t *pm = control + NVN2_C0_LAYOUT + 12;   // per-primitive output map (nvn2_lower.cpp): system byte, 16 generic bytes
+        int any = 0;
+        for (int k = 0; k < 17; k++) any |= pm[k];
+        if (any) {
+            o += sprintf(o, ",\"prim\":\"");
+            for (int k = 0; k < 17; k++) o += sprintf(o, "%02x", pm[k]);
+            o += sprintf(o, "\"");
+        }
     }
     if (!memcmp(control + NVN2_C0_LAYOUT, "DKT1", 4)) {
         uint16_t m[4];
@@ -2460,7 +2468,7 @@ void gfx_shader_local_size(const GfxShader *s, uint32_t local[3]) { memcpy(local
 #define ANS_PACKED GS_ANS_PACKED
 #define ANS_REC (4 + 32 + 32 + ANS_PACKED + 1)
 #define ANS_REC_V1 (4 + 32 + 32 + ANSWERS_PACKED + 1)
-#define PRG_VERSION 1
+#define PRG_VERSION 2   // 2: the control section carries the per-primitive output map (nvn2_lower.cpp)
 #define PRG_HEAD (12 + 32 + CONTROL_SIZE)
 typedef struct { char magic[8]; uint32_t version, rec_size; } RecHeader;
 typedef struct { uint64_t *v; uint32_t cap, n; } Set64;    // open addressing, 0 empty

@@ -71,6 +71,23 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_FOV] = "Field of view",
     [UI_MENU_FOV_DESC] = "How much of the world the camera shows, in percent of the game's own. Game version 1.4.3 only.",
     [UI_MENU_SHARPNESS] = "FSR sharpness",
+    [UI_MENU_SCENE_UP] = "Scene upscaling",
+    [UI_MENU_SCENE_UP_DESC] = "How the 3D scene is scaled from the game's render resolution, before the HUD. FSR 1 keeps "
+                              "edges sharp. TAA and FSR 2 (experimental) use the last frames too: less shimmer on leaves "
+                              "and edges, sometimes a faint trail behind fast motion.",
+    [UI_MENU_SCENE_UP_EASU] = "AMD FSR 1", [UI_MENU_SCENE_UP_BILINEAR] = "Bilinear",
+    [UI_MENU_SCENE_UP_TAA] = "TAA + FSR 1", [UI_MENU_SCENE_UP_FSR2] = "AMD FSR 2",
+    [UI_MENU_FRAMEGEN] = "Frame generation",
+    [UI_MENU_FRAMEGEN_DESC] = "Shows frames made between the game's, for a smoother picture on a high refresh rate "
+                              "monitor (2x on 120 Hz, 4x on 240 Hz). Experimental: fast motion may show artefacts.",
+    [UI_MENU_FRAMEGEN_OFF] = "Off",
+    [UI_MENU_QUALITY] = "Quality preset",
+    [UI_MENU_QUALITY_DESC] = "Sets the 3D render scale, scene upscaling, frame generation (by your monitor's refresh "
+                             "rate) and texture compression together. Auto picks by your graphics card's memory. "
+                             "Changing one of them yourself makes it Custom. The render scale and texture compression "
+                             "apply after a restart.",
+    [UI_MENU_QUALITY_CUSTOM] = "Custom", [UI_MENU_QUALITY_AUTO] = "Auto", [UI_MENU_QUALITY_LOW] = "Low",
+    [UI_MENU_QUALITY_MEDIUM] = "Medium", [UI_MENU_QUALITY_HIGH] = "High", [UI_MENU_QUALITY_ULTRA] = "Ultra",
     [UI_MENU_SHARPNESS_DESC] = "Sharpening after FSR scaling; 0 turns it off.",
     [UI_MENU_COLOR] = "Colour",
     [UI_MENU_COLOR_PRESET] = "Colour profile",
@@ -331,6 +348,24 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_FOV] = "Поле зрения",
     [UI_MENU_FOV_DESC] = "Сколько мира показывает камера, в процентах от игрового. Только для версии игры 1.4.3.",
     [UI_MENU_SHARPNESS] = "Резкость FSR",
+    [UI_MENU_SCENE_UP] = "Масштабирование сцены",
+    [UI_MENU_SCENE_UP_DESC] = "Как 3D-сцена масштабируется из разрешения рендера игры, до интерфейса. FSR 1 сохраняет "
+                              "резкость краёв. TAA и FSR 2 (экспериментально) используют и прошлые кадры: меньше мерцания "
+                              "листвы и краёв, иногда слабый след за быстрым движением.",
+    [UI_MENU_SCENE_UP_EASU] = "AMD FSR 1", [UI_MENU_SCENE_UP_BILINEAR] = "Билинейное",
+    [UI_MENU_SCENE_UP_TAA] = "TAA + FSR 1", [UI_MENU_SCENE_UP_FSR2] = "AMD FSR 2",
+    [UI_MENU_FRAMEGEN] = "Генерация кадров",
+    [UI_MENU_FRAMEGEN_DESC] = "Показывает кадры, созданные между кадрами игры, для плавной картинки на мониторе с "
+                              "высокой частотой (2x на 120 Гц, 4x на 240 Гц). Экспериментально: при быстром движении "
+                              "возможны артефакты.",
+    [UI_MENU_FRAMEGEN_OFF] = "Выкл.",
+    [UI_MENU_QUALITY] = "Пресет качества",
+    [UI_MENU_QUALITY_DESC] = "Задаёт сразу масштаб 3D-рендера, масштабирование сцены, генерацию кадров (по частоте "
+                             "монитора) и сжатие текстур. Авто выбирает по памяти видеокарты. Если изменить что-то из "
+                             "этого вручную, пресет станет Свой. Масштаб рендера и сжатие текстур применяются после "
+                             "перезапуска.",
+    [UI_MENU_QUALITY_CUSTOM] = "Свой", [UI_MENU_QUALITY_AUTO] = "Авто", [UI_MENU_QUALITY_LOW] = "Низкое",
+    [UI_MENU_QUALITY_MEDIUM] = "Среднее", [UI_MENU_QUALITY_HIGH] = "Высокое", [UI_MENU_QUALITY_ULTRA] = "Ультра",
     [UI_MENU_SHARPNESS_DESC] = "Повышение резкости после масштабирования FSR; 0 выключает его.",
     [UI_MENU_COLOR] = "Цвет",
     [UI_MENU_COLOR_PRESET] = "Цветовой профиль",
