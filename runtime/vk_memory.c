@@ -1061,14 +1061,18 @@ static int query_stamp(uint64_t lo, uint64_t hi, uint32_t g) {
 //   reports it at the fence (vk_gpu_written), which copies those bytes back into guest memory. Until then the CPU
 //   copies skip them: a page the CPU and the GPU both write keeps the GPU's bytes.
 // TOTK_SHADOW=1/0 forces the mode on or off; the default is on for Linux.
-typedef struct { uint64_t lo, hi; } SRange;
+// snap: the guest bytes when the GPU write was recorded (ranges up to SPEND_SNAP bytes); cpu: the CPU has written them
+// since, so its bytes win (spend_cpu_won); fresh: recorded in the batch the next sync goes before, so the GPU has not
+// written it yet and the CPU's bytes are that write's input.
+typedef struct { uint64_t lo, hi; uint8_t *snap; int cpu, fresh; } SRange;
+#define SPEND_SNAP 4096
 static PlatMutex shadow_lock = PLAT_MUTEX_INIT;   // after pool_lock; before gen_lock
 static PoolRec **stouch;                          // shadow_lock: pools resolved since the last sync
 static int nstouch, cstouch;
 static SRange *spend;                             // shadow_lock: GPU writes recorded and not copied back yet
 static int nspend, cspend;
 static int64_t s_live_n, s_live_bytes;            // shadow_lock
-static uint64_t s_syncs, s_copied, s_queries, s_untracked, s_wb_bytes, s_ticks;   // shadow_lock: since the last log
+static uint64_t s_syncs, s_copied, s_queries, s_untracked, s_wb_bytes, s_wb_seen, s_qbytes, s_ticks;   // shadow_lock: since the last log
 
 static int shadow_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     r->import_lo = addr & ~0xfffull;
@@ -1119,11 +1123,24 @@ static void shadow_forget(PoolRec *r) {
     plat_mutex_unlock(&shadow_lock);
 }
 
+// shadow_lock held: whether the CPU has written the bytes of a pending GPU write since it was recorded. Then the CPU's
+// bytes win, as when the GPU uses guest memory itself: they go to the shadow, and the fence does not copy the GPU's
+// back over them. Ocarina zeroes its sky ambient accumulator (twelve floats that a compute adds into with atomics) on
+// the CPU while the previous frame's add is still pending; the zero was dropped, the sum grew by the sky's light every
+// frame (5240 instead of ~5 after a minute) and the scene went white. TOTK_SHADOW_SNAP=0 restores the GPU-wins rule.
+static int spend_cpu_won(SRange *s) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_SHADOW_SNAP"); on = !(e && *e == '0'); }
+    if (!on || !s->snap) return 0;
+    if (!s->cpu && memcmp((const void *)(uintptr_t)s->lo, s->snap, s->hi - s->lo)) s->cpu = 1;
+    return s->cpu;
+}
+
 // shadow_lock held: copies guest [a, b) into the shadow, leaving out the bytes of GPU writes not copied back yet
-// (spend from index i on).
+// (spend from index i on) unless the CPU has written them since (spend_cpu_won).
 static void shadow_copy(PoolRec *r, uint64_t a, uint64_t b, int i) {
     for (; i < nspend; i++)
-        if (spend[i].lo < b && spend[i].hi > a) {
+        if (spend[i].lo < b && spend[i].hi > a && !spend[i].fresh && !spend_cpu_won(&spend[i])) {
             if (spend[i].lo > a) shadow_copy(r, a, spend[i].lo, i + 1);
             if (spend[i].hi < b) shadow_copy(r, spend[i].hi, b, i + 1);
             return;
@@ -1132,18 +1149,45 @@ static void shadow_copy(PoolRec *r, uint64_t a, uint64_t b, int i) {
     s_copied += b - a;
 }
 
+// The sync each 2 MiB region was last queried in (shadow_lock): pools share regions, and a query's answer stays in the
+// generation table, so one query per region per sync serves every pool over it (Ocarina, Kokiri Forest: 541 queries
+// over 7 GiB, 17 ms a frame, before). sreg_untracked: that query could not tell. TOTK_SHADOW_REGION_ONCE=0: per pool.
+static uint32_t sreg_at[RT_ADDRESS_LIMIT >> REG_SHIFT], s_sync_ep;
+static uint8_t sreg_untracked[RT_ADDRESS_LIMIT >> REG_SHIFT];
+static int region_once = -1, shadow_freeze = 1;   // TOTK_SHADOW_FREEZE=0: the sync offers no freeze candidates
+
+static int sreg_skip(uint64_t a) {
+    return mem_frozen(a) || (region_once && sreg_at[a >> REG_SHIFT] == s_sync_ep);
+}
+
 // shadow_lock and gen_lock held: stamps the pool's written pages and copies those newer than its shadow.
 static void shadow_sync_pool(PoolRec *r) {
     uint64_t lo = r->import_lo, hi = r->import_hi;
     uint32_t g = ++gen_now;
     int tracked = 1;
-    for (uint64_t a = lo; a < hi;) {   // one query per run of regions that are not frozen
+    for (uint64_t a = lo; a < hi;) {   // one query per run of regions that are not frozen nor queried in this sync
         uint64_t b = (a | ((1ull << REG_SHIFT) - 1)) + 1;
         if (b > hi) b = hi;
-        if (mem_frozen(a)) { a = b; continue; }
-        while (b < hi && !mem_frozen(b)) b = b + (1ull << REG_SHIFT) < hi ? b + (1ull << REG_SHIFT) : hi;
-        s_queries++;
-        if (!query_stamp(a, b, g)) tracked = 0;
+        if (sreg_skip(a)) {
+            if (!mem_frozen(a) && sreg_untracked[a >> REG_SHIFT]) tracked = 0;
+            a = b;
+            continue;
+        }
+        while (b < hi && !sreg_skip(b)) b = b + (1ull << REG_SHIFT) < hi ? b + (1ull << REG_SHIFT) : hi;
+        s_queries++, s_qbytes += b - a;
+        int t = query_stamp(a, b, g);
+        if (!t) tracked = 0;
+        for (uint64_t k = a >> REG_SHIFT; k <= (b - 1) >> REG_SHIFT; k++) {
+            sreg_at[k] = s_sync_ep, sreg_untracked[k] = (uint8_t)!t;
+            // A freeze candidate as in snap_regions: regions only this sync queried were never offered, so pools nothing
+            // wrote for minutes were queried at every submit (6.6 GiB a frame in Kokiri Forest).
+            if (t && freeze_idle && shadow_freeze && ww_ep - reg_last[k] >= (uint32_t)freeze_idle &&
+                ww_ep - reg_tried[k] >= (uint32_t)freeze_idle) {
+                reg_tried[k] = ww_ep;
+                if (nfcand == cfcand) grow((void **)&fcand, &cfcand, sizeof *fcand);
+                fcand[nfcand++] = (uint32_t)k;
+            }
+        }
         a = b;
     }
     uint32_t since = r->sgen;
@@ -1176,6 +1220,11 @@ void vk_mem_shadow_sync(void) {
     if (!shadow_on) return;
     uint64_t t0 = qpc();
     plat_mutex_lock(&shadow_lock);
+    if (region_once < 0) {
+        const char *e = getenv("TOTK_SHADOW_REGION_ONCE"), *f = getenv("TOTK_SHADOW_FREEZE");
+        region_once = !(e && *e == '0'), shadow_freeze = !(f && *f == '0');
+    }
+    if (!++s_sync_ep) ++s_sync_ep;   // 0 marks a region never queried
     if (nstouch) {
         plat_mutex_lock(&gen_lock);
         for (int i = 0; i < nstouch; i++) shadow_sync_pool(stouch[i]), stouch[i]->stouched = 0;
@@ -1183,6 +1232,7 @@ void vk_mem_shadow_sync(void) {
         s_syncs += (uint64_t)nstouch;
         nstouch = 0;
     }
+    for (int i = 0; i < nspend; i++) spend[i].fresh = 0;   // this batch goes to the GPU now
     s_ticks += qpc() - t0;
     plat_mutex_unlock(&shadow_lock);
 }
@@ -1191,8 +1241,45 @@ void vk_mem_gpu_pending(uint64_t addr, uint64_t size) {
     if (!shadow_on || !size) return;
     plat_mutex_lock(&shadow_lock);
     if (nspend == cspend) grow((void **)&spend, &cspend, sizeof *spend);
-    spend[nspend++] = (SRange){addr, addr + size};
+    uint8_t *snap = NULL;
+    if (size <= SPEND_SNAP && (snap = malloc(size))) memcpy(snap, (const void *)(uintptr_t)addr, size);
+    spend[nspend++] = (SRange){addr, addr + size, snap, 0, 1};
     plat_mutex_unlock(&shadow_lock);
+}
+
+// shadow_lock held: copies the pages of [addr, addr+size) whose shadow bytes differ from guest memory back into it, and
+// stamps only those (vk_guest_written). A written range is the whole storage binding (up to WRITTEN_CAP), and most of
+// it is unchanged: copying it all thawed its regions, stamped it, and the next sync copied the same bytes into the
+// shadow again (Ocarina, Kokiri Forest: 88 MiB written back and 84 MiB copied in per frame, ~25 ms).
+// TOTK_SHADOW_WB_DIFF=0 copies the whole range as before.
+static void shadow_write_back(PoolRec *r, uint64_t addr, uint64_t size) {
+    static int diff = -1;
+    if (diff < 0) { const char *e = getenv("TOTK_SHADOW_WB_DIFF"); diff = !(e && *e == '0'); }
+    const uint8_t *src = r->smap + (addr - r->import_lo);
+    if (!diff) {
+        mem_thaw(addr, size);
+        memcpy((void *)(uintptr_t)addr, src, size);
+        s_wb_bytes += size;
+        vk_guest_written(addr, size);
+        return;
+    }
+    uint64_t end = addr + size, run = 0;
+    for (uint64_t a = addr; a < end;) {
+        uint64_t b = (a | 0xfffull) + 1;
+        if (b > end) b = end;
+        int changed = memcmp((const void *)(uintptr_t)a, src + (a - addr), b - a) != 0;
+        if (changed && !run) run = a;
+        if (run && (!changed || b == end)) {
+            uint64_t hi = changed ? b : a;
+            mem_thaw(run, hi - run);
+            memcpy((void *)(uintptr_t)run, src + (run - addr), hi - run);
+            s_wb_bytes += hi - run;
+            vk_guest_written(run, hi - run);
+            run = 0;
+        }
+        s_wb_seen += b - a;
+        a = b;
+    }
 }
 
 void vk_gpu_written(uint64_t addr, uint64_t size) {
@@ -1201,15 +1288,19 @@ void vk_gpu_written(uint64_t addr, uint64_t size) {
         const pidx_ent *e = pidx_find(&pool_index, addr, size);
         PoolRec *r = e ? e->buf : NULL;
         plat_mutex_lock(&shadow_lock);
-        if (r && r->smap && addr >= r->import_lo && addr + size <= r->import_hi) {
-            mem_thaw(addr, size);
-            memcpy((void *)(uintptr_t)addr, r->smap + (addr - r->import_lo), size);
-            s_wb_bytes += size;
-        }
+        int k = -1;
         for (int i = 0; i < nspend; i++)
-            if (spend[i].lo == addr && spend[i].hi == addr + size) { spend[i] = spend[--nspend]; break; }
+            if (spend[i].lo == addr && spend[i].hi == addr + size) { k = i; break; }
+        int cpu = k >= 0 && spend_cpu_won(&spend[k]);
+        int shadowed = r && r->smap && addr >= r->import_lo && addr + size <= r->import_hi;
+        if (!cpu && shadowed) shadow_write_back(r, addr, size);
+        if (k >= 0) {
+            free(spend[k].snap);
+            spend[k] = spend[--nspend];
+        }
         plat_mutex_unlock(&shadow_lock);
         plat_mutex_unlock_shared(&pool_lock);
+        if (shadowed) return;   // guest memory changed only where shadow_write_back copied, and it stamped those pages
     }
     vk_guest_written(addr, size);
 }
@@ -1217,12 +1308,12 @@ void vk_gpu_written(uint64_t addr, uint64_t size) {
 static void shadow_log(uint64_t frame) {
     if (!shadow_on) return;
     plat_mutex_lock(&shadow_lock);
-    rt_log("mem: shadow at frame %llu: %lld pools %.1f MiB; since the last: %llu pool syncs, %llu queries, %.1f MiB "
-           "copied in (%llu untracked), %.1f MiB written back, %.2f ms, %d GPU writes pending",
+    rt_log("mem: shadow at frame %llu: %lld pools %.1f MiB; since the last: %llu pool syncs, %llu queries over %.1f MiB, %.1f MiB "
+           "copied in (%llu untracked), %.1f of %.1f MiB written back, %.2f ms, %d GPU writes pending",
            (unsigned long long)frame, (long long)s_live_n, s_live_bytes / 1048576.0, (unsigned long long)s_syncs,
-           (unsigned long long)s_queries, s_copied / 1048576.0, (unsigned long long)s_untracked, s_wb_bytes / 1048576.0,
-           qpc_ms(s_ticks), nspend);
-    s_syncs = s_queries = s_copied = s_untracked = s_wb_bytes = s_ticks = 0;
+           (unsigned long long)s_queries, s_qbytes / 1048576.0, s_copied / 1048576.0, (unsigned long long)s_untracked, s_wb_bytes / 1048576.0,
+           s_wb_seen / 1048576.0, qpc_ms(s_ticks), nspend);
+    s_syncs = s_queries = s_copied = s_untracked = s_wb_bytes = s_wb_seen = s_qbytes = s_ticks = 0;
     plat_mutex_unlock(&shadow_lock);
 }
 
@@ -2710,6 +2801,7 @@ void vk_mem_shutdown(void) {
     nsnap_pool = 0, snap_pool_bytes = 0;
     plat_mutex_unlock(&snap_pool_lock);
     plat_mutex_lock(&shadow_lock);
+    for (int i = 0; i < nspend; i++) free(spend[i].snap);
     nstouch = nspend = 0;   // shadows too
     s_live_n = s_live_bytes = 0;
     plat_mutex_unlock(&shadow_lock);

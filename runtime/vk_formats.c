@@ -130,22 +130,26 @@ VkFormat tex_rgb9e5_target(void) {
     return e && *e == 'u' ? VK_FORMAT_R32_UINT : VK_FORMAT_R32_SFLOAT;
 }
 
-// Storage addresses drawn as RGB9E5 through the stand-in: their bytes hold RGB9E5 texels, so a B10G11R11 texture over the
-// same storage (the upscaler's r11g11b10f descriptor) is sampled through an E5B9G9R9 view, which decodes them as the
-// Switch does. A small set: the game draws one such target per scene size.
+// Storage addresses whose newest content the RGB9E5 stand-in drew: those bytes hold RGB9E5 texels, so a B10G11R11
+// texture over the same storage (the upscaler's r11g11b10f descriptor) is sampled through an E5B9G9R9 view, which
+// decodes them as the Switch does. The game reuses that storage within the frame for an ordinary r11g11b10f scene
+// target, so any other draw or store there takes the address out again (marking it for good turned the scene's colours
+// into noise). Called while commands are recorded, in their GPU order, on the replay thread.
 static uint64_t e5_addr[16];
-static volatile int e5_n;
+static int e5_n;
 void tex_rgb9e5_note(uint64_t addr) {
-    int n = __atomic_load_n(&e5_n, __ATOMIC_ACQUIRE);
-    for (int i = 0; i < n; i++) if (e5_addr[i] == addr) return;
-    if (n == 16) return;
-    e5_addr[n] = addr;
-    __atomic_store_n(&e5_n, n + 1, __ATOMIC_RELEASE);
-    rt_log("vk: RGB9E5 target at %#llx: textures over it are sampled as RGB9E5", (unsigned long long)addr);
+    for (int i = 0; i < e5_n; i++) if (e5_addr[i] == addr) return;
+    if (e5_n < 16) e5_addr[e5_n++] = addr;
+}
+void tex_rgb9e5_forget(uint64_t addr) {
+    for (int i = 0; i < e5_n; i++)
+        if (e5_addr[i] == addr) {
+            e5_addr[i] = e5_addr[--e5_n];
+            return;
+        }
 }
 int tex_rgb9e5_at(uint64_t addr) {
-    int n = __atomic_load_n(&e5_n, __ATOMIC_ACQUIRE);
-    for (int i = 0; i < n; i++) if (e5_addr[i] == addr) return 1;
+    for (int i = 0; i < e5_n; i++) if (e5_addr[i] == addr) return 1;
     return 0;
 }
 

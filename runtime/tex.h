@@ -69,5 +69,6 @@ int tex_vk_format_supported(const TexVkFormat *f);
 // 1 when NVN's RGB9E5 is a B10G11R11 image drawn through an R32_SFLOAT view (the device cannot render RGB9E5)
 int tex_rgb9e5_stand_in(void);
 VkFormat tex_rgb9e5_target(void);
-void tex_rgb9e5_note(uint64_t addr);   // a stand-in target drawn at this storage address
-int tex_rgb9e5_at(uint64_t addr);       // 1 when a stand-in target was drawn there   // the format draws into that stand-in use (view and pipeline)
+void tex_rgb9e5_note(uint64_t addr);     // the stand-in target was drawn at this storage address
+void tex_rgb9e5_forget(uint64_t addr);   // something else was drawn or stored there
+int tex_rgb9e5_at(uint64_t addr);        // 1 while the newest content there is the stand-in's   // the format draws into that stand-in use (view and pipeline)

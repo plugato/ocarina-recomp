@@ -623,6 +623,7 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
     }
     uint32_t swz = (uint32_t)sw[0] | (uint32_t)sw[1] << 8 | (uint32_t)sw[2] << 16 | (uint32_t)sw[3] << 24;
     VkFormat view_format = storage ? vk_srgb_store_format(img->format) : img->format;
+    if (storage) tex_rgb9e5_forget(img->addr);   // a store over the RGB9E5 stand-in's storage replaces its texels
     if (!storage && img->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && tex_rgb9e5_at(img->addr))
         view_format = VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;   // bytes the RGB9E5 stand-in drew (vk_formats.c)
     // LOCAL TEST (Ocarina): a game can store through a view in another format of the same size (Ocarina's tone map packs
@@ -1527,6 +1528,17 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
         }
         if (b->addr && !guarded) warn_once(W_SSBO_ALIGN, "storage buffer %#llx is not backed or not aligned: a zero buffer is bound",
                                (unsigned long long)b->addr);
+        if (b->addr && !guarded) {   // LOCAL TEST (Ocarina): which program binds an unbacked storage buffer, and from where
+            static int nlog;
+            const uint8_t *ctl, *code;
+            uint32_t len;
+            uint64_t org = ex->prog && find_stage(ex->prog, st, &ctl, &code, &len) ? nvn2_origin(code) : 0;
+            if (nlog++ < 40)
+                rt_log("vk: unbacked ssbo %#llx size %#llx stage %d origin %016llx prog %llu slot %d ubo %d cbuf c%d+%#x frame %llu",
+                       (unsigned long long)b->addr, (unsigned long long)b->size, st, (unsigned long long)org,
+                       ex->prog ? (unsigned long long)ex->prog->serial : 0ull, slot, ubo, r->cbuf_slot, r->handle * 4,
+                       (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
+        }
     } else {
         warn_once(W_SSBO_SLOT, "a storage buffer whose address is at c%d+%#x (stage %d) is not replayed: a zero buffer is bound",
                   r->cbuf_slot, r->handle * 4, st);
@@ -4012,7 +4024,9 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
         }
         idx++;
     }
-    if (__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) >= 1797 && __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) <= 1800 && d->caller == 0x70005646ac && c0_lay) {   // LOCAL TEST (Ocarina)
+    static long p1_from = -2;   // LOCAL TEST (Ocarina): OOT_P1_AT=<frame>: the pass-1 family line for frames from..from+3 (default 1797)
+    if (p1_from == -2) { const char *e = getenv("OOT_P1_AT"); p1_from = e ? atol(e) : 1797; }
+    if ((long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) >= p1_from && (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) <= p1_from + 3 && d->caller == 0x70005646ac && c0_lay) {   // LOCAL TEST (Ocarina)
         uint8_t bank[VK_C0_BYTES];
         vk_c0_fill(bank, NVN_STAGE_CS, ex->ssbo[NVN_STAGE_CS], ex->ubo[NVN_STAGE_CS], c0_dim, c0_binst);
         uint64_t a50, a60, a70, a80, a90;
