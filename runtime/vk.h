@@ -257,6 +257,11 @@ void vk_gpu_written(uint64_t addr, uint64_t size);
 // binding): the stamp does not make the next mirror sync upload the bytes the mirror already holds.
 void vk_gpu_written_mirrored(uint64_t addr, uint64_t size);
 int vk_mem_span_mirrored(const VkMemSpan *sp);
+// LOCAL TEST (Ocarina): OOT_CAPTURE=1: the CPU's writes into mirrored pools as of the submit call (game thread), applied
+// by the replay of that submission (vk_memory.c "submit-time capture"). NULL when off.
+typedef struct VkMemCapture VkMemCapture;
+VkMemCapture *vk_mem_capture(void);
+void vk_mem_capture_set(VkMemCapture *c);   // replay, before recording the submission the capture was taken for
 int vk_mem_flush_add_probe(void);        // --probe-vkexec: the flush range list; 0 or the number of the failed check
 uint64_t vk_mem_mirror_uploaded(void);   // --probe-vkexec: bytes copied into mirrors since the last summary line
 int vk_mem_mirror_probe(uint64_t addr);   // --probe-vkexec: the pool at addr gets its mirror as on a first buffer use;

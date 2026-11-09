@@ -16,6 +16,7 @@ Cenário de todas as medições: Floresta Kokiri, na varanda da casa do Link, sa
 | Todos os computes grandes compilados (vegetação e folhas se mexem) | 25 | 71 | `27bf943` |
 | Mirror sem re-upload, merge até 16 MiB, `lag3`, EV 0 | ~50 | 60 | `3f0eedd` |
 | Replay mais leve (15 → 13 ms por frame) | ~50 | 60 | `a89bbd3` |
+| Captura das escritas da CPU no submit (`OOT_CAPTURE`) | ~55-57 | 61 | este |
 
 Com o monitor a 100 Hz, 50 fps é exatamente uma imagem a cada 2 atualizações da tela, um ritmo regular.
 
@@ -80,11 +81,33 @@ e a CPU lê 29. No console a GPU está adiantada, e o valor fica em 44, o mesmo 
   thread.
 - `rt_live` sem `OOT_LIVE` lê cada variável de ambiente uma vez só.
 
+### Captura das escritas da CPU no submit
+
+A cada `nvnQueueSubmitCommands`, ainda na thread do jogo, o runtime consulta o write-watch de todos os mirrors e
+carimba as páginas escritas. Em seguida copia **naquele instante** o conteúdo delas, desde a captura anterior, para um
+buffer de staging. Ficam de fora as páginas cujo carimbo mais novo é o write-back do próprio mirror.
+
+O primeiro prólogo daquele submit copia esse staging para os mirrors. Daí em diante o sync do mirror só sobe regiões
+que o write-watch não rastreia, e os `FlushMappedRange` não sobem mais nada. Com isso, cada submit vê as escritas da CPU
+feitas antes dele, como no hardware, e não o que o jogo escreveu depois enquanto o replay ou a GPU ainda não tinham
+chegado lá.
+
+O upload caiu de 48 para 1,3 MiB por frame. `OOT_CAPTURE` é 1 por padrão e 0 volta ao caminho antigo; dá para trocar
+ao vivo.
+
+Junto veio o pool de snapshots do merge, que passou de 16 para 96 MiB (`OOT_SNAP_POOL_MIB`). Com merges de até 16 MiB
+a floresta faz 89 MiB de snapshots por frame, e o pool antigo obrigava a criar 13 buffers novos por frame.
+
+Limite conhecido: o acumulador da soma de cena (`0x1040` bytes, compute `435a0138b9013040`) às vezes não zera por
+alguns frames (44, 87, 131…), porque o write-back de um submit ainda em voo põe a soma por cima do zero que a CPU
+escreveu na memória do jogo. A imagem não muda (brilho 60-62, igual ao Eglantine). Uma correção completa seria um
+merge que soma a diferença da GPU, em vez de sobrescrever, nos buffers que ela acumula.
+
 ## Ajustes com o jogo aberto
 
 `OOT_LIVE=/caminho/live.txt` faz o runtime reler esse arquivo a cada 250 ms. Cada linha tem a forma `NOME=VALOR`.
-Funciona para `OOT_SUBMIT_SYNC`, `OOT_EV`, `OOT_MERGE_MAX_MIB`, `OOT_MIRROR_STAGE`, `TOTK_MIRROR_WB_RESYNC` e
-`TOTK_FLUSH_TRUST`. Cada mudança aparece no log como `live: NOME=VALOR`.
+Funciona para `OOT_SUBMIT_SYNC`, `OOT_EV`, `OOT_MERGE_MAX_MIB`, `OOT_MIRROR_STAGE`, `TOTK_MIRROR_WB_RESYNC`,
+`TOTK_FLUSH_TRUST`, `OOT_CAPTURE` e `OOT_SNAP_POOL_MIB`. Cada mudança aparece no log como `live: NOME=VALOR`.
 
 ## Experimentos que ficaram desligados
 
@@ -101,12 +124,20 @@ hash das páginas flushadas e não encontrou nenhuma mudança sem registro.
 
 ## O que falta para 60 fps
 
-- **Os 46,8 MiB de upload por frame.** É o gargalo atual. Precisa de um write-back que some a diferença da GPU em vez
-  de sobrescrever, ou de capturar as escritas da CPU no momento de cada submit. Com isso, `TOTK_FLUSH_TRUST` fica
-  seguro.
+- **O thread de replay.** A GPU trabalha ~13 ms por frame, mas fica ~5 ms parada esperando o próximo command buffer:
+  o replay leva ~15 ms para gravar um frame. O perfil é espalhado: `bind_resources` 12%, cópias e comparações de
+  memória ~11%, `vk_usnap_find` 3%, a fila do recorder 3%. Medido sem efeito:
+  - partes menores de command buffer (`TOTK_SPLIT_US`, `TOTK_SPLIT_DRAWS`);
+  - lag maior (`lag4`, `lag5`);
+  - compilar os computes grandes com otimização (o driver já otimiza, os tempos de GPU não mudaram);
+  - baixar a prioridade da thread do driver.
+- **`lag6` ou mais ainda pisca**, mesmo com a captura. Sobra o snapshot de uniforms, que é tirado quando o replay grava,
+  e não no submit.
 - **Uma thread do driver NVIDIA** (aparece com o nome `guest main`, dentro de `_nv002nvvm`) fica a 100% de um núcleo
   desde o início do gameplay. O driver está compilando algo em segundo plano. Não é a rede de upscale do vídeo, e
-  `__GL_THREADED_OPTIMIZATIONS=0` não muda nada.
+  `__GL_THREADED_OPTIMIZATIONS=0` não muda nada. Baixar a prioridade dela também não mudou o fps.
+- **A memória do processo** pula de ~9,3 para ~14 GB por volta dos 4 minutos e meio de jogo e depois fica estável. Isso
+  acontece com e sem a captura, então não vem destas mudanças.
 - **60 fps num monitor de 100 Hz tremem**, porque os frames alternam entre 1 e 2 atualizações da tela. Use o monitor
   em 60 ou 120 Hz.
 

@@ -518,6 +518,9 @@ static void game_defaults(void) {
         // vk_memory.c: storage written by shaders goes back to guest memory word by word up to 16 MiB (was 4): a plain
         // copy of 8 MiB guarded bindings wrote 45 MiB a frame over PCIe and over the CPU's newer bytes.
         {"OOT_MERGE_MAX_MIB", "16"},
+        // vk_memory.c "submit-time capture": the CPU's writes reach the mirrors as of each submit call, so the flushed
+        // ranges (46.8 MiB a frame in the forest) no longer go up whole: ~50 -> ~56 fps, same picture.
+        {"OOT_CAPTURE", "1"},
     };
     for (size_t i = 0; i < sizeof d / sizeof *d; i++) {
         if (getenv(d[i][0])) continue;
