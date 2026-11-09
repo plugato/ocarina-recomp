@@ -229,6 +229,8 @@ def main():
         seed.mkdir(parents=True)
         for f in ('seed-answers.bin', 'pipeline-keys.bin'):
             shutil.copy2(args.seed / f, seed / f)
+        if (args.seed / 'big-compute.txt').is_file():   # the big compute shaders play met: P-BigShaders builds them
+            shutil.copy2(args.seed / 'big-compute.txt', seed / 'big-compute.txt')
         print('shader seed:', ', '.join(f'{p.name} {p.stat().st_size // 1024} KiB' for p in seed.iterdir()))
     env = dict(os.environ, PATH=f'{msys};{os.environ["PATH"]}')
     run(['sh', ROOT / 'instalador' / 'build_exe.sh'], env=env)

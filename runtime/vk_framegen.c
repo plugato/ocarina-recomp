@@ -64,7 +64,8 @@ int vk_framegen_mult(void) {
 
 static int make_pass(VkCtx *c, Pass *p, const uint32_t *code, size_t size, const VkDescriptorType *types, int n,
                      uint32_t push, const VkSpecializationInfo *spec) {
-    VkDescriptorSetLayoutBinding b[4];
+    VkDescriptorSetLayoutBinding b[5];   // camflow binds 5: with 4 the fifth wrote past the array (stack check abort)
+    if (n > (int)(sizeof b / sizeof *b)) return 0;
     for (int i = 0; i < n; i++)
         b[i] = (VkDescriptorSetLayoutBinding){.binding = (uint32_t)i, .descriptorType = types[i], .descriptorCount = 1,
                                               .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};

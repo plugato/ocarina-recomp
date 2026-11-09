@@ -210,6 +210,10 @@ typedef struct {
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl;
     VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT fbl;
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr;
+    VkPhysicalDeviceMaintenance5FeaturesKHR m5;
+#ifdef VK_KHR_pipeline_binary   // Vulkan headers 1.3.296+; without them pipeline binaries stay off
+    VkPhysicalDevicePipelineBinaryFeaturesKHR pbin;
+#endif
 } FeatureChain;
 
 static int create_device(void) {
@@ -217,7 +221,7 @@ static int create_device(void) {
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof *ep);
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
-    const char *ext[28];
+    const char *ext[48];
     uint32_t n_ext = 0;
     for (size_t i = 0; i < sizeof k_required_ext / sizeof *k_required_ext; i++) ext[n_ext++] = k_required_ext[i];
 
@@ -258,6 +262,27 @@ static int create_device(void) {
     if (has_ext(ep, ne, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) { g_vk.has_memory_budget = 1; ext[n_ext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME; }
     // GPU breadcrumbs for a lost device (vk_crumbs.c): AMD's drivers and RADV report it.
     if (has_ext(ep, ne, VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) { g_vk.has_buffer_marker = 1; ext[n_ext++] = VK_AMD_BUFFER_MARKER_EXTENSION_NAME; }
+    // Pipeline binaries (vk_pipeline.c "pipeline binaries"): slow pipelines are kept as the driver's own binaries in
+    // files, because AMD's disk cache (4 MiB per application) dropped them and every start compiled them again for
+    // minutes. Needs maintenance5 on a 1.3 instance. TOTK_PIPE_BINARIES=0 leaves both extensions off; =1 turns them on
+    // for any driver. By default only on AMD's Windows branch for RDNA 1/2 (vk_caps.amd_sc): RADV keeps pipelines in Mesa's cache.
+    vk_caps_driver(g_vk.phys);
+    {
+        const char *pb = getenv("TOTK_PIPE_BINARIES");
+        int want_pb = pb && *pb ? strcmp(pb, "0") != 0 : vk_caps.amd_sc;
+#ifndef VK_KHR_pipeline_binary
+        (void)want_pb;
+#else
+        if (want_pb && has_ext(ep, ne, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME) &&
+            has_ext(ep, ne, VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
+            g_vk.has_pipeline_binary = 1;
+            ext[n_ext++] = VK_KHR_MAINTENANCE_5_EXTENSION_NAME;
+            ext[n_ext++] = VK_KHR_PIPELINE_BINARY_EXTENSION_NAME;
+            CHAIN(m5, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR);
+            CHAIN(pbin, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR);
+        }
+#endif
+    }
     // Graphics pipeline library: chained last so it can be dropped again when vk_caps_gpl declines it.
     void **gpl_link = NULL;
     if (has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
@@ -271,7 +296,6 @@ static int create_device(void) {
     // The driver fills the chain with what it supports; the same chain then enables all of it (robustBufferAccess
     // stays on: guest shaders index constant buffers freely and out-of-range reads must stay harmless).
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &c->f2);
-    vk_caps_driver(g_vk.phys);
     vk_caps_features(&c->f2.features);
     if (gpl_link) {
         VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gp = {
@@ -296,6 +320,9 @@ static int create_device(void) {
     if (!c->mesh.meshShader) g_vk.has_mesh_shader = 0;
     c->mesh.multiviewMeshShader = c->mesh.primitiveFragmentShadingRateMeshShader = c->mesh.meshShaderQueries = 0;   // need features not enabled
     if (!c->fault.deviceFault) g_vk.has_device_fault = 0;   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
+#ifdef VK_KHR_pipeline_binary
+    if (g_vk.has_pipeline_binary && (!c->pbin.pipelineBinaries || !c->m5.maintenance5)) g_vk.has_pipeline_binary = 0;
+#endif
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
     g_vk.has_astc_ldr = h->textureCompressionASTC_LDR;
     {

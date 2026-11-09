@@ -1,0 +1,22 @@
+--- a/src/Ryujinx.Graphics.Shader/StructuredIr/ShaderProperties.cs
++++ b/src/Ryujinx.Graphics.Shader/StructuredIr/ShaderProperties.cs
+@@ -1,3 +1,4 @@
++using Ryujinx.Graphics.Shader.Translation;
+ using System.Collections.Generic;
+ 
+ namespace Ryujinx.Graphics.Shader.StructuredIr
+@@ -70,7 +71,13 @@
+             // specify a format, we can just declare it without a format and the GPU will handle it.
+             if (gpuAccessor.QueryHostSupportsImageLoadFormatted())
+             {
+-                return TextureFormat.Unknown;
++                // An integer image still needs its format: without one it is declared float, and a store of raw
++                // words (Ocarina packs R11G11B10 itself and stores it through an R32UI view) converts them.
++                TextureFormat integer = gpuAccessor.QueryTextureFormat(handle, cbufSlot);
++
++                AggregateType component = integer.GetComponentType();
++
++                return component == AggregateType.U32 || component == AggregateType.S32 ? integer : TextureFormat.Unknown;
+             }
+ 
+             TextureFormat format = gpuAccessor.QueryTextureFormat(handle, cbufSlot);

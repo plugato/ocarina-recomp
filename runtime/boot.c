@@ -363,9 +363,46 @@ void rt_boot(void) {
     cb_addr[2] = hostfn_register("<rtld module_finis>", cb_module_finis);
     hostfn_seal();
     uint64_t held = plat_now_ms();
-    if (warm) plat_thread_join(warm);
-    else vk_pipeline_prewarm();
+    // TOTK_PREWARM_WAIT_MS (default 15000 where vk_pipeline_keeps_binaries, 0 = wait for all elsewhere): the guest starts once the prewarm is done
+    // or after this long, and the prewarm goes on in the background. A few pipelines took AMD's Windows compiler minutes
+    // each and the window stayed empty for over four minutes at every start (RX 5500 XT).
+    const char *pw = getenv("TOTK_PREWARM_WAIT_MS");
+    uint64_t cap_ms = pw && *pw ? strtoull(pw, NULL, 0) : 0u;
+    // TOTK_PREWARM_ONLY=1: build every recorded pipeline (vk_pipeline.c "big compiles left for the next start": the big
+    // ones keep their pipeline binary), save, and end before the guest starts. jogar\jogar-ocarina.ps1 runs it before it
+    // opens the game, so those compiles have the RAM the game would hold.
+    // Tested: docs/test-environment-rx5500xt.md.
+    const char *po = getenv("TOTK_PREWARM_ONLY");
+    int prewarm_only = po && !strcmp(po, "1");
+    if (prewarm_only) cap_ms = 0;
+    // The device is created on the prewarm thread: the driver is known only once it exists.
+    int joined = 0;
+    if (warm && !(pw && *pw) && !prewarm_only) {
+        int k;
+        while ((k = vk_pipeline_keeps_binaries()) < 0 && !joined) joined = plat_thread_join_ns(warm, 2000000ull);
+        if (k > 0) cap_ms = 15000u;
+    }
+    if (joined) {
+        // the prewarm ended first
+    } else if (warm && cap_ms) {
+        if (!plat_thread_join_ns(warm, cap_ms * 1000000ull))
+            rt_log("boot: the prewarm goes on in the background after %llu ms (TOTK_PREWARM_WAIT_MS)", (unsigned long long)cap_ms);
+    } else if (warm) {
+        plat_thread_join(warm);
+    } else {
+        vk_pipeline_prewarm();
+    }
     held = plat_now_ms() - held;
+    if (prewarm_only) {
+        uint64_t t_cs = plat_now_ms();
+        vk_pipeline_prep_compute();
+        t_cs = plat_now_ms() - t_cs;
+        vk_pipeline_save();
+        rt_log("boot: prewarm only: done (pipelines %llu ms, big compute shaders %llu ms); the guest does not start "
+               "(TOTK_PREWARM_ONLY)", (unsigned long long)held, (unsigned long long)t_cs);
+        fflush(stdout), fflush(stderr);
+        plat_exit(0);
+    }
     rt_log("boot: guest starts %llu ms after process start (%llu ms of it waiting for the prewarm)",
            (unsigned long long)(plat_process_uptime_ns() / 1000000), (unsigned long long)held);
     rt_guest_start_ns = kern_now_ns();

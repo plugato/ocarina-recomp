@@ -111,7 +111,7 @@ What solved the biggest bugs so far was **measuring and comparing against a refe
 | `OOT_FOLLOW_DISP=<frame>:<k>:<c0>` | Follows a dispatch, together with `TOTK_DUMP_BUF=0:<size>` |
 | `TOTK_XLATE_IR=<folder>` | The translator writes the blocks and IR of each shader with a subroutine |
 | `TOTK_SPV_OVERRIDE=<folder>` | Replaces shaders with `sh_<hash>.spv` files. The hash changes when the translator changes, and the old file silently stops applying |
-| `OOT_BIG_CS_WORDS`, `OOT_BIG_CS_OPT=1` | Control background compilation of large compute shaders |
+| `OOT_BIG_CS_WORDS`, `OOT_BIG_CS_OPT=1`, `OOT_BIG_CS_THREADS`, `OOT_BIG_CS_HUGE` | Control background compilation of large compute shaders: the size from which they go to the background, optimization, how many build at once (default 2 with 24 GB of RAM or more, else 1) and the size from which only one builds at a time (default 262144 words). The smallest queued one goes first |
 | `TOTK_TRACE=perf` | Logs memory traffic per frame. Start here when the frame rate is low |
 
 **When reading GPU buffers:** read after `VK_MEM_USE`. Before it, you see an old CPU copy.

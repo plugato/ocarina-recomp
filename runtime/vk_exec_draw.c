@@ -48,6 +48,7 @@ static const uint32_t (*c0_push)[NVN2_ROOT_WORDS];
 #define MAX_DESC 1024
 #define CHUNK_BYTES (4u << 20)
 #define ZERO_BYTES 65536u
+#define SUPPORT_MESH_FIRST 1376u   // LOCAL TEST (Ocarina): tfe_vertex_count, the mesh first of translator patch 0036
 #define SUPPORT_BYTES 1408u   // Ryujinx SupportBuffer (std140): alpha_test, is_bgra[8], viewport_inverse, viewport_size, ...
 #define NVN_STAGE_VS 0
 #define NVN_STAGE_FS 1
@@ -2094,6 +2095,25 @@ static VkDescriptorSet alloc_set(VkExec *ex, VkDescriptorSetLayout layout) {
     return VK_NULL_HANDLE;
 }
 
+// LOCAL TEST (Ocarina): an indirect mesh draw's first workgroup. NVN's record is {count, 0, 0, first}: a task program runs
+// the workgroups [first, first + count), and Vulkan's start at 0. The draw gets a support buffer of its own (bind_resources),
+// mesh_args copies the record's first into it on the GPU (tfe_vertex_count, which only transform feedback emulation in
+// vertex programs reads), and translator patch 0041 adds it to a task program's workgroup index (its mesh workgroups still
+// count from 0, as in Hookshot's EmitIsbeRead). Drawing from 0 repeated the first records: in daylight the foliage drew as
+// stretched strips on the ground and the shadow cascades as long spikes. OOT_MESH_FIRST=0: first ignored.
+static int mesh_first_pending;
+static VkBuffer mesh_first_buf;
+static VkDeviceSize mesh_first_off;
+static int mesh_first_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("OOT_MESH_FIRST");
+        on = !(e && !strcmp(e, "0"));
+        rt_log("vk: indirect mesh first workgroup %s", on ? "applied" : "ignored (OOT_MESH_FIRST=0)");
+    }
+    return on;
+}
+
 static void support_in(const VkExec *ex, float in[3]) {   // what support_fill reads: viewport size, point size
     in[0] = ex->in_pass && ex->has_vp ? ex->vp[0][2] : (float)ex->pass_w;
     in[1] = ex->in_pass && ex->has_vp ? ex->vp[0][3] : (float)ex->pass_h;
@@ -2538,6 +2558,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         if (b->kind == VK_PIPE_SUPPORT) {
             float in[3];
             support_in(ex, in);
+            if (mesh_first_pending && !mesh_first_buf) B.sup_valid = 0;   // LOCAL TEST (Ocarina): this draw's own buffer
             if (!B.sup_valid || memcmp(in, B.sup_in, sizeof in)) {   // support_fill reads only these
                 uint8_t tmp[SUPPORT_BYTES];
                 support_fill(tmp, in[0], in[1], in[2]);
@@ -2550,6 +2571,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
                     B.sup_buf = sb, B.sup_off = so, B.sup_valid = 1;
                 }
             }
+            if (mesh_first_pending && !mesh_first_buf) mesh_first_buf = B.sup_buf, mesh_first_off = B.sup_off;
             o->buffer = (VkDescriptorBufferInfo){B.sup_buf, B.sup_off, SUPPORT_BYTES};
         } else if (b->kind == GFX_RES_UBO) {
             for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ubo_info(ex, st, r->slot + (int)k);
@@ -3694,7 +3716,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
 
 // LOCAL TEST (Ocarina): NVN's indirect mesh record is {count, first}, Vulkan's {x, y, z}: y = first (usually 0) drew nothing.
 // The game's culling writes the record earlier in the frame, so its count is copied on the GPU into a record {count, 1, 1}.
-// ponytail: a pass break per draw and first ignored; copies gathered before the pass and first through c0 lift both.
+// ponytail: a pass break per draw; copies gathered before the pass lift it. The record's first: mesh_first_pending.
 static VkBuffer mesh_ring;
 static uint32_t mesh_ring_next;
 enum { MESH_RING_N = 1 << 16 };
@@ -3722,6 +3744,10 @@ static int mesh_args(VkExec *ex, const VkMemSpan *ip, VkDeviceSize *offset) {
     VkBufferCopy cp = {ip->offset + (use12 ? 12 : 0), *offset, 4};
     vkCmdFillBuffer(cb, mesh_ring, *offset + 4, 8, 1);   // y, z. Commands through the recorder's wrappers: it owns this command buffer
     vkCmdCopyBuffer(cb, ip->buffer, mesh_ring, 1, &cp);
+    if (mesh_first_buf) {   // LOCAL TEST (Ocarina): the record's first into this draw's support buffer
+        VkBufferCopy fc = {ip->offset + 12, mesh_first_off + SUPPORT_MESH_FIRST, 4};
+        vkCmdCopyBuffer(cb, ip->buffer, mesh_first_buf, 1, &fc);
+    }
     ex->recorded++;
     vk_exec_barrier(ex);
     vk_exec_inline_end(reopen);
@@ -3734,7 +3760,7 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
     if (!fn) fn = (PFN_vkCmdDrawMeshTasksIndirectEXT)vkGetDeviceProcAddr(vk_ctx()->device, "vkCmdDrawMeshTasksIndirectEXT");
     c0_binst = 0;
     VkMemSpan ip;
-    if (!vk_mem_resolve(d->ind, sizeof(VkDrawMeshTasksIndirectCommandEXT), &ip) || ip.offset % 4)
+    if (!vk_mem_resolve(d->ind, 16, &ip) || ip.offset % 4)   // LOCAL TEST (Ocarina): 16: the record's first at + 12
         return warn_once(W_INDIRECT, "indirect mesh arguments at %#llx are not backed or not aligned: draws skipped", (unsigned long long)d->ind);
     da_count(4);
     da_capture(ex, &ip);
@@ -3793,17 +3819,25 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
     VK_MEM_USE(ip);   // the copy reads the same buffer the GPU's culling wrote (the mirror, when there is one)
     static int mesh_old = -1;   // LOCAL TEST (Ocarina): OOT_MESH_OLD=1: the record as it is
     if (mesh_old < 0) mesh_old = getenv("OOT_MESH_OLD") != NULL;
-    if (!ENV_ONCE("OOT_MESH_DIRECT") && !mesh_old && !mesh_args(ex, &ip, &mesh_off)) {
-        static int told;
-        if (!told++) rt_log("vk: indirect mesh draw dropped: mesh_args failed");
-        return;
-    }
-    if (da_on()) rt_log("draw args: mesh past args prog %llu", ex->prog ? (unsigned long long)ex->prog->serial : 0ull);
+    // The draw is prepared first, so its support buffer exists when mesh_args copies the first into it
+    // (mesh_args breaks the pass and opens it again)
+    int first_on = mesh_first_on() && !mesh_old && !ENV_ONCE("OOT_MESH_DIRECT");
+    if (first_on) mesh_first_pending = 1, mesh_first_buf = VK_NULL_HANDLE, B.res_valid = 0;
     draw_is_mesh = 1;
     int ok = prepare_draw(ex, NVN_DRAW_PRIMITIVE_TRIANGLES, 0x7fffffff, 0);
     draw_is_mesh = 0;
+    mesh_first_pending = 0;
+    if (first_on) B.sup_valid = 0, B.res_valid = 0;   // the next draw takes another support buffer and builds its sets
     if (mesh_task_draw) B.c0_valid[0] = 0;
     mesh_task_draw = 0;
+    if (ok && !ENV_ONCE("OOT_MESH_DIRECT") && !mesh_old && !mesh_args(ex, &ip, &mesh_off)) {
+        static int told;
+        if (!told++) rt_log("vk: indirect mesh draw dropped: mesh_args failed");
+        mesh_first_buf = VK_NULL_HANDLE;
+        return;
+    }
+    mesh_first_buf = VK_NULL_HANDLE;
+    if (da_on()) rt_log("draw args: mesh past args prog %llu", ex->prog ? (unsigned long long)ex->prog->serial : 0ull);
     if (da_on()) rt_log("draw args: mesh prepare prog %llu ok %d pass %ux%u", ex->prog ? (unsigned long long)ex->prog->serial : 0ull, ok, ex->pass_w, ex->pass_h);
     if (!ok) return;
     vk_exec_frame.draws++;

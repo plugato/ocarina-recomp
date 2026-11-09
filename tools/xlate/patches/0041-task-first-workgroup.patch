@@ -1,0 +1,14 @@
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitAttribute.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitAttribute.cs
+@@ -245,6 +245,11 @@
+                 Operand index = context.Load(StorageKind.Input, IoVariable.CtaId, null, Const(0));
+                 if (NxMesh.IsTask)
+                 {
++                    // LOCAL TEST (Ocarina): NVN draws the task workgroups [first, first + count) and Vulkan from 0. The host
++                    // copies an indirect draw's first into the draw's own support buffer, in tfe_vertex_count (only transform
++                    // feedback emulation in vertex programs reads it; 0 otherwise). Only the task stage: its mesh workgroups
++                    // count from 0 (Hookshot EmitIsbeRead). Without it the foliage drew its first records again and again.
++                    index = context.IAdd(index, context.Load(StorageKind.ConstantBuffer, SupportBuffer.Binding, Const((int)SupportBufferField.TfeVertexCount)));
+                     context.Copy(GetDest(reg), index);
+                     return;
+                 }

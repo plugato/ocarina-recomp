@@ -111,7 +111,7 @@ O que resolveu os bugs maiores até agora foi **medir e comparar com uma referê
 | `OOT_FOLLOW_DISP=<frame>:<k>:<c0>` | Segue um dispatch, junto com `TOTK_DUMP_BUF=0:<tamanho>` |
 | `TOTK_XLATE_IR=<pasta>` | O tradutor grava os blocos e o IR de cada shader com subrotina |
 | `TOTK_SPV_OVERRIDE=<pasta>` | Troca shaders por arquivos `sh_<hash>.spv`. O hash muda quando o tradutor muda, e o arquivo antigo para de valer sem aviso |
-| `OOT_BIG_CS_WORDS`, `OOT_BIG_CS_OPT=1` | Controlam a compilação em segundo plano dos compute shaders grandes |
+| `OOT_BIG_CS_WORDS`, `OOT_BIG_CS_OPT=1`, `OOT_BIG_CS_THREADS`, `OOT_BIG_CS_HUGE` | Controlam a compilação em segundo plano dos compute shaders grandes: o tamanho a partir do qual vão para o segundo plano, a otimização, quantos compilam juntos (padrão 2 com 24 GB de RAM ou mais, senão 1) e a partir de que tamanho só um por vez (padrão 262144 palavras). O menor da fila vai primeiro |
 | `TOTK_TRACE=perf` | Registra o tráfego de memória por frame. Comece por aqui quando o fps estiver baixo |
 
 **Ao ler buffers da GPU:** leia depois do `VK_MEM_USE`. Antes dele, você vê uma cópia antiga da CPU.

@@ -384,6 +384,34 @@ function P-Shaders() {
         foreach ($f in $pack, (Join-Path $dir 'seed-programs.bin')) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
     }
 }
+# The big compute shaders (32,000 SPIR-V words and more) are built in the background in play, and their dispatches are
+# skipped until they are ready. The fog and light volume is accumulated from frame to frame, so the skipped frames spoil it
+# for the session: Kokiri lost its fog and the trees their leaves, and on AMD, where these builds take minutes, the
+# scene went white. Built here, before the first start, into the driver's cache (ocarina.exe --warm-big-cs, the seed's
+# list added to the player's): play then finds them at once. A shader already in the cache takes no time; run again
+# after a driver update. Not needed to play: if it fails, the game still builds them as before.
+function P-BigShaders() {
+    $dir = Build 'oot111'
+    $lista = Join-Path $dir 'big-compute.txt'
+    $semente = Join-Path $script:pasta 'tools\data\oot-seed\big-compute.txt'
+    if (Test-Path -LiteralPath $semente) {
+        $linhas = @()
+        if (Test-Path -LiteralPath $lista) { $linhas += Get-Content -LiteralPath $lista }
+        $linhas += Get-Content -LiteralPath $semente
+        Set-Content -LiteralPath $lista -Value ($linhas | Where-Object { $_ } | Select-Object -Unique) -Encoding ascii
+    }
+    if (-not (Test-Path -LiteralPath $lista)) { Registrar 'shaders grandes: sem lista, passo pulado'; return }
+    try {
+        # at most 30 minutes of new builds (an AMD card took 3 hours for the whole list, #188): the rest is built in play
+        $env:OOT_WARM_BUDGET_S = '1800'
+        Exec (Join-Path $dir 'ocarina.exe') @('--warm-big-cs') | Out-Null
+    } catch {
+        if ("$($_.Exception.Message)" -eq 'CANCELADO') { throw }
+        Registrar "shaders grandes: nem todos foram montados, o jogo monta os que faltam ao jogar: $($_.Exception.Message)"
+    } finally {
+        Remove-Item Env:OOT_WARM_BUDGET_S -ErrorAction SilentlyContinue
+    }
+}
 function P-Finalizar() {
     $ini = Build 'oot111\totk.ini'
     if (-not (Test-Path $ini)) { Copy-Item (Join-Path $script:pasta 'jogar\totk.ini') $ini }
@@ -404,6 +432,7 @@ function Passos() { return @(
     @((L 'Preparar os arquivos do jogo (pode levar mais de 1 hora em HD)' 'Prepare the game files (can take over 1 hour on a hard drive)'), 25, 'P-Romfs'),
     @((L 'Compilar o jogo (a parte mais demorada)' 'Build the game (the longest part)'), 35, 'P-Exe'),
     @((L 'Preparar os shaders (evita travadas na primeira vez)' 'Prepare the shaders (avoids stutter the first time)'), 3, 'P-Shaders'),
+    @((L 'Montar os shaders grandes (pode levar alguns minutos)' 'Build the big shaders (can take a few minutes)'), 4, 'P-BigShaders'),
     @((L 'Criar o atalho' 'Create the shortcut'), 1, 'P-Finalizar')
 ) }
 

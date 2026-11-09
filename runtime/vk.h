@@ -38,7 +38,8 @@ typedef struct VkCtx {
     int has_custom_border_color, has_eds, has_eds2, has_eds3, has_vertex_input_dynamic_state,
         has_conditional_rendering, has_transform_feedback, has_provoking_vertex, has_device_fault, has_memory_budget,
         has_robustness2, has_buffer_device_address, has_fragment_shader_interlock, has_buffer_marker,
-        has_mesh_shader, has_astc_ldr;      // textureCompressionASTC_LDR (enabled when reported)
+        has_mesh_shader, has_astc_ldr,      // textureCompressionASTC_LDR (enabled when reported)
+        has_pipeline_binary;                // VK_KHR_pipeline_binary + maintenance5 (vk_pipeline.c pipeline binaries)
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. TOTK_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
     // old behaviour); VK_FEEDBACK_LAYOUT with VK_EXT_attachment_feedback_loop_layout and dynamicRenderingLocalRead
@@ -563,6 +564,8 @@ int vk_pipeline_async_on(void);   // 1 after vk_pipeline_async_enable: graphics 
 // cached under the current translator from their stored inputs, and builds every recorded pipeline, on all cores.
 // No-op without vk_pipeline_async_enable, with TOTK_PIPE_PREBUILD=0 or with TOTK_GPU=null.
 void vk_pipeline_prewarm(void);
+int vk_pipeline_keeps_binaries(void);  // 1 on the drivers that keep pipeline binaries, 0 elsewhere, -1 before the device exists
+void vk_pipeline_prep_compute(void);   // TOTK_PREWARM_ONLY: recorded big compute shaders built once, kept as binaries
 VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info);
 int vk_pipeline_compute_ready(const GfxShader *cs);   // LOCAL TEST (Ocarina): 0 while a big compute shader builds in the background
 void vk_pipeline_big_cs_met(const GfxShader *cs, uint64_t origin);   // LOCAL TEST (Ocarina): lists it for --warm-big-cs

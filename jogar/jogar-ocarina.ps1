@@ -24,5 +24,13 @@ if ((Test-Path -LiteralPath $erros) -and (Get-Item -LiteralPath $erros).Length -
     }
 }
 Set-Location (Join-Path $raiz "build\oot111")
+
+# AMD: antes de abrir o jogo, prepara os shaders que ficaram para depois na última partida (jogar\preparar-shaders.ps1).
+# Sem nada na fila leva 2 a 4 s e nenhuma janela aparece; com algo na fila, abre a janela de progresso com o log ao vivo.
+if (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'AMD|Radeon' }) {
+    try { & (Join-Path $PSScriptRoot "preparar-shaders.ps1") -Raiz $raiz } catch { }
+    Set-Location (Join-Path $raiz "build\oot111")
+}
+
 $extras = if ($args.Count) { @{ ArgumentList = $args } } else { @{} }
 Start-Process .\ocarina.exe @extras -RedirectStandardOutput $saida -RedirectStandardError $erros

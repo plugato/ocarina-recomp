@@ -130,6 +130,7 @@ typedef struct Pipe {
     const struct Layout *lay;          // graphics: the layout it was entered with
     VkPipeline fast;                   // GPL: the fast-linked pipeline (kept until shutdown: recorded draws use it)
     uint8_t fast_tried;
+    uint8_t waited_out;                // a draw's wait for it ran out while it built: later draws skip at once (wait_once)
     size_t key_size;
     uint8_t key[];
 } Pipe;
@@ -2224,6 +2225,387 @@ static uint32_t vs_union_missing(const VkPipeState *s, GfxShaderIo fin[32]) {
     return missing;
 }
 
+#define PIPE_NOOPT_WORDS_AMD 0   // TOTK_PIPE_NOOPT_WORDS default on AMD: off. Unoptimized big pipelines lost the device on the RX 5500 XT (driver 26.10.1)
+
+// The big compiles left for the next start and the extra compile workers below rely on finished pipelines being kept.
+// Without VK_KHR_pipeline_binary (an older driver, TOTK_PIPE_BINARIES=0) a compile left for later would never be kept,
+// so those cards keep the behaviour they had.
+static int amd_keeps_binaries(void) {
+    VkCtx *c = vk_ctx();
+    return vk_caps.amd_sc && c && c->has_pipeline_binary;
+}
+
+// ---- compile memory gate
+// AMD's Windows compiler takes gigabytes for Ocarina's big pipelines: six workers compiling at once took a 16 GB PC
+// from 10 to 33 GB committed, left 44 MB of RAM free, the driver crashed and the PC rebooted (RX 5500 XT, driver
+// 26.10.1). A pipeline or library compile starts only while the system keeps TOTK_PIPE_MIN_FREE_MB of RAM free
+// (default: an eighth of the RAM, at least 1536 MB), unless no other compile is running, so one always goes on.
+// TOTK_PIPE_MIN_FREE_MB=0 turns it off. Builds from a pipeline binary and fast links do not pass through it. Only on
+// drivers with amd_keeps_binaries. A compile on the replay thread holding P.lock never waits here (tl_holds_plock): the
+// picture would freeze for as long as the other compile runs. It still counts as running, so the others wait for it.
+// Tested: docs/test-environment-rx5500xt.md (preparation: 1380 pipelines and 50 big compute shaders, free RAM never
+// below 2.3 GB).
+static struct {
+    PlatMutex m;
+    PlatCond cv;
+    int running;                       // compiles between mg_enter and mg_leave
+    int big_running;                   // of them, big ones (big_pipeline): one at a time in play
+    uint64_t big_last_ns;              // when the last big one started
+    int64_t min_mb;                    // -1 not read yet, 0 off
+    uint32_t waited, logged;
+} MG = {.m = PLAT_MUTEX_INIT, .cv = PLAT_COND_INIT, .min_mb = -1};
+
+// Before the guest starts (the prewarm; TOTK_PREWARM_ONLY) big compiles run side by side: another starts once the last
+// one had 45 s to grow and TOTK_PIPE_PREP_FREE_MB (default 7168) of RAM and of commit (RAM + page file) are still free.
+// One takes 1-10 minutes and grows to about 4-5 GB with the game closed. With 5120 MB of RAM, 30 s and no commit check,
+// the free RAM fell to 285 MB and the free commit to 299 MB (16 GB, a 7 GB page file that Windows grows on its own).
+static float mg_free_mb(void);
+static double mg_commit_free_mb(void) {
+    double proc, used, limit;
+    plat_commit_info(&proc, &used, &limit);
+    return limit > 0 && used >= 0 ? limit - used : -1;
+}
+static int mg_big_parallel_ok(void) {
+    static int64_t free_mb = -1;
+    if (free_mb < 0) {
+        const char *e = getenv("TOTK_PIPE_PREP_FREE_MB");
+        free_mb = e && *e ? strtoll(e, NULL, 0) : 7168;
+    }
+    if (rt_guest_start_ns || plat_now_ns() - MG.big_last_ns < 45000000000ull) return 0;
+    float f = mg_free_mb();
+    double c = mg_commit_free_mb();
+    return f >= 0 && f >= (float)free_mb && (c < 0 || c >= (double)free_mb);
+}
+
+static float mg_free_mb(void) {
+    float used, total, proc;
+    plat_mem_info(&used, &total, &proc);
+    return total > 0 && used >= 0 ? total - used : -1;
+}
+
+static _Thread_local int tl_holds_plock;   // this thread compiles synchronously with P.lock held (pipe_miss, vk_pipeline_compute)
+
+static void mg_enter(int big) {
+    if (!amd_keeps_binaries()) return;
+    plat_mutex_lock(&MG.m);
+    if (MG.min_mb < 0) {
+        const char *e = getenv("TOTK_PIPE_MIN_FREE_MB");
+        float used, total, proc;
+        plat_mem_info(&used, &total, &proc);
+        int64_t def = total > 0 ? (int64_t)(total / 8) : 1536;
+        MG.min_mb = e && *e ? strtoll(e, NULL, 0) : def < 1536 ? 1536 : def;
+        if (MG.min_mb < 0) MG.min_mb = 0;
+        if (MG.min_mb) rt_log("vk_pipeline: a compile waits while another runs and less than %lld MB of RAM is free",
+                              (long long)MG.min_mb);
+    }
+    float f = 0;
+    int waits = 0;
+    uint64_t t0 = 0;
+    double cf;
+    // Commit too: with the page file at its current size Windows refuses allocations at the limit, and a driver
+    // allocation that fails mid-compile crashed amdvlk64.dll.
+    while (!tl_holds_plock &&
+           ((big && MG.big_running > 0 && !mg_big_parallel_ok()) ||
+            (MG.min_mb && MG.running > 0 && (f = mg_free_mb()) >= 0 && f < (float)MG.min_mb) ||
+            (MG.min_mb && MG.running > 0 && (cf = mg_commit_free_mb()) >= 0 && cf < (double)MG.min_mb))) {
+        if (!waits++) {
+            t0 = plat_now_ns(), MG.waited++;
+            if (MG.logged < 8)
+                MG.logged++, rt_log("vk_pipeline: compile held: %.0f MB of RAM free, %d compiles running (%d big)%s",
+                                    mg_free_mb(), MG.running, MG.big_running, big ? "; this one is big" : "");
+        }
+        plat_cond_wait_ms(&MG.cv, &MG.m, 250);
+    }
+    if (waits && MG.logged < 8) rt_log("vk_pipeline: compile released after %.1f s", (double)(plat_now_ns() - t0) / 1e9);
+    MG.running++, MG.big_running += big != 0;
+    if (big) MG.big_last_ns = plat_now_ns();
+    plat_mutex_unlock(&MG.m);
+}
+
+static void mg_leave(int big) {
+    if (!amd_keeps_binaries()) return;
+    plat_mutex_lock(&MG.m);
+    MG.running--, MG.big_running -= big != 0;
+    plat_cond_broadcast(&MG.cv);
+    plat_mutex_unlock(&MG.m);
+}
+
+// ---- big compiles left for the next start
+// A graphics pipeline, or the vertex or fragment shader library of one, of TOTK_PIPE_BIG_WORDS SPIR-V words or more
+// (default 40000 on AMD, 0 = off elsewhere) is big. Ocarina's ~65,000-word fragment shaders took AMD's Windows
+// compiler 4-5 minutes and gigabytes each: with 16 GB the game alone holds about 10 GB, and one such compile in play took
+// the free RAM from 2.2 GB to 160 MB in 7 s (RX 5500 XT, driver 26.10.1). So:
+// - big compiles run one at a time (mg_enter);
+// - TOTK_PREWARM_ONLY=1, which jogar\jogar-ocarina.ps1 runs (jogar\preparar-shaders.ps1) before it opens the game,
+//   builds them, and the pipeline binary keeps the result;
+// - while the guest runs one starts only with TOTK_PIPE_BIG_FREE_MB (default 10240) of RAM free. Otherwise it is left
+//   for the next preparation: the pipeline's key goes to pipeline-keys.bin and its draws are skipped this run. The
+//   game's own boot prewarm leaves them too, so a game started without the preparation keeps skipping them (logged once).
+// TOTK_PIPE_BIG_WORDS=0 turns all of this off.
+static _Thread_local int tl_deferred;   // the last create_graphics / lib_create on this thread left its compile
+static struct {
+    int64_t words, free_mb;            // -1 not read yet
+    volatile int32_t deferred;
+} BIG = {-1, -1, 0};
+
+static int big_pipeline(uint64_t words) {
+    if (BIG.words < 0) {   // read once; racing threads read the same values
+        const char *w = getenv("TOTK_PIPE_BIG_WORDS"), *f = getenv("TOTK_PIPE_BIG_FREE_MB");
+        int64_t fm = f && *f ? strtoll(f, NULL, 0) : 10240;
+        BIG.free_mb = fm < 0 ? 0 : fm;
+        // 40000: a 44,000-word pipeline compiled in play crashed amdvlk64.dll in a pipe worker with the free RAM at 433 MB
+        int64_t bw = w && *w ? strtoll(w, NULL, 0) : amd_keeps_binaries() ? 40000 : 0;
+        BIG.words = bw < 0 ? 0 : bw;
+        if (BIG.words)
+            rt_log("vk_pipeline: compiles of %lld SPIR-V words or more run one at a time; in play they wait for the next "
+                   "start unless %lld MB of RAM is free", (long long)BIG.words, (long long)BIG.free_mb);
+    }
+    return BIG.words > 0 && words >= (uint64_t)BIG.words;
+}
+
+// 1 (and tl_deferred set) when a big compile must wait for the next start.
+// Above TOTK_PREP_CS_MAX_WORDS (default 1,000,000) never in play, whatever the free RAM: the title screen's compute
+// shaders of 1.4-7.2 million words take the driver minutes and over 30 GB; one started with 10.7 GB free and took the
+// free RAM to 21 MB in a minute. The preparation leaves them out too, so their dispatches stay skipped.
+static uint64_t prep_cs_max_words(void) {
+    static uint64_t w = ~0ull;
+    if (w == ~0ull) {
+        const char *e = getenv("TOTK_PREP_CS_MAX_WORDS");
+        w = e && *e ? strtoull(e, NULL, 0) : 1000000u;
+    }
+    return w;
+}
+
+// Only TOTK_PREWARM_ONLY (the preparation, the game closed) compiles big ones at once. The game's own boot prewarm
+// leaves them too: started with 10 GB free before the guest, three ran on into play after TOTK_PREWARM_WAIT_MS.
+static int big_defer(uint64_t words, const char *what) {
+    if (!big_pipeline(words)) return 0;
+    static int prep = -1;
+    if (prep < 0) {
+        const char *po = getenv("TOTK_PREWARM_ONLY");
+        prep = po && !strcmp(po, "1");
+    }
+    if (prep) return 0;
+    float f = mg_free_mb();
+    if (rt_guest_start_ns && words <= prep_cs_max_words() && (f < 0 || f >= (float)BIG.free_mb)) return 0;
+    tl_deferred = 1;
+    {
+        static volatile int32_t said;
+        if (plat_inc32(&said) == 1)
+            rt_log("vk_pipeline: big pipelines (%lld SPIR-V words or more) are built only by jogar\\preparar-shaders.ps1 "
+                   "(TOTK_PREWARM_ONLY=1) or in play with %lld MB of RAM free. Started any other way, their draws and dispatches "
+                   "are skipped on every run", (long long)BIG.words, (long long)BIG.free_mb);
+    }
+    if (plat_inc32(&BIG.deferred) <= 16)
+        rt_log("vk_pipeline: %s of %llu words left for the next start (%.0f MB of RAM free, %lld wanted); its draws are "
+               "skipped this run", what, (unsigned long long)words, f, (long long)BIG.free_mb);
+    return 1;
+}
+
+// Compile threads the RAM allows on AMD: one per 8 GB (16 GB, 16315 MB usable -> 2), at least 1.
+static int mg_compilers_by_ram(void) {
+    float used, total, proc;
+    plat_mem_info(&used, &total, &proc);
+    int n = total > 0 ? (int)((total + 1024) / 8192) : 2;
+    return n < 1 ? 1 : n;
+}
+
+// ---- pipeline binaries (VK_KHR_pipeline_binary, vk_device.c has_pipeline_binary)
+// Built only with Vulkan headers that have the extension (1.3.296+); older ones (Ubuntu 24.04's 1.3.280) get the stubs
+// after the section, and has_pipeline_binary stays 0.
+#ifndef VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR
+#define VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR 0x80000000ULL
+#endif
+#ifdef VK_KHR_pipeline_binary
+// A graphics pipeline that took TOTK_PIPE_BINARY_MS (500; 0 on AMD) or more to compile is kept as the driver's own binaries in
+// <exe dir>/pipeline-binaries/<global key>/<pipeline key>.bin, and later runs create it from them without compiling.
+// AMD's Windows driver keeps 4 MiB of pipelines per application on disk and dropped Ocarina's big ones: three took it
+// 290-301 s each at every start, and new areas met more (RX 5500 XT, driver 26.10.1). The global key changes with the
+// driver, which starts a new folder; a binary the driver refuses falls back to a normal compile.
+// Tested: docs/test-environment-rx5500xt.md.
+#define PB_MAGIC 0x4e494250u   // "PBIN"
+#define PB_MAX 16
+static struct {
+    int state;   // 0 not set up, 1 on, -1 off
+    char dir[PLAT_PATH_MAX * 2];
+    uint32_t save_ms;
+    PFN_vkGetPipelineKeyKHR key;
+    PFN_vkCreatePipelineBinariesKHR create;
+    PFN_vkGetPipelineBinaryDataKHR data;
+    PFN_vkReleaseCapturedPipelineDataKHR release;
+    PFN_vkDestroyPipelineBinaryKHR destroy;
+    volatile int32_t loaded, saved, refused;
+} PB;
+static PlatMutex pb_lock = PLAT_MUTEX_INIT;
+
+static void pb_hex(const uint8_t *b, uint32_t n, char *out) {
+    static const char d[] = "0123456789abcdef";
+    for (uint32_t i = 0; i < n; i++) out[2 * i] = d[b[i] >> 4], out[2 * i + 1] = d[b[i] & 15];
+    out[2 * n] = 0;
+}
+
+static int pb_on(void) {
+    int st = __atomic_load_n(&PB.state, __ATOMIC_ACQUIRE);
+    if (st) return st > 0;
+    plat_mutex_lock(&pb_lock);
+    if (!PB.state) {
+        VkCtx *c = vk_ctx();
+        int on = 0;
+        if (c && amd_keeps_binaries() && P.cache_path[0]) {
+            PB.key = (PFN_vkGetPipelineKeyKHR)vkGetDeviceProcAddr(c->device, "vkGetPipelineKeyKHR");
+            PB.create = (PFN_vkCreatePipelineBinariesKHR)vkGetDeviceProcAddr(c->device, "vkCreatePipelineBinariesKHR");
+            PB.data = (PFN_vkGetPipelineBinaryDataKHR)vkGetDeviceProcAddr(c->device, "vkGetPipelineBinaryDataKHR");
+            PB.release = (PFN_vkReleaseCapturedPipelineDataKHR)vkGetDeviceProcAddr(c->device, "vkReleaseCapturedPipelineDataKHR");
+            PB.destroy = (PFN_vkDestroyPipelineBinaryKHR)vkGetDeviceProcAddr(c->device, "vkDestroyPipelineBinaryKHR");
+            VkPipelineBinaryKeyKHR gk = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
+            if (PB.key && PB.create && PB.data && PB.release && PB.destroy && PB.key(c->device, NULL, &gk) == VK_SUCCESS &&
+                gk.keySize && gk.keySize <= VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR) {
+                char hex[2 * VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR + 1];
+                pb_hex(gk.key, gk.keySize, hex);
+                snprintf(PB.dir, sizeof PB.dir, "%s", P.cache_path);
+                char *cut = plat_last_sep(PB.dir);
+                if (cut) {
+                    *cut = 0;
+                    size_t l = strlen(PB.dir);
+                    snprintf(PB.dir + l, sizeof PB.dir - l, "/pipeline-binaries/%.16s", hex);
+                    plat_file_mkdir_p(PB.dir);
+                    // On AMD every compiled pipeline is kept (0 ms): a binary loads in a few ms with no compiler
+                    // memory, and its compile took gigabytes of RAM (compile memory gate); a few hundred KB each on disk.
+                    const char *e = getenv("TOTK_PIPE_BINARY_MS");
+                    PB.save_ms = e && *e ? (uint32_t)strtoul(e, NULL, 0) : 0u;
+                    on = plat_dir_exists(PB.dir);
+                }
+            }
+        }
+        if (on) rt_log("vk_pipeline: graphics pipelines that compile in %u ms or more are kept as binaries in %s", PB.save_ms, PB.dir);
+        else rt_log("vk_pipeline: pipeline binaries off");
+        __atomic_store_n(&PB.state, on ? 1 : -1, __ATOMIC_RELEASE);
+    }
+    plat_mutex_unlock(&pb_lock);
+    return PB.state > 0;
+}
+
+// The file of the pipeline pci (a VkGraphicsPipelineCreateInfo or VkComputePipelineCreateInfo) would create; 0 when
+// the driver gives no key.
+static int pb_path(const void *pci, char *path, size_t cap) {
+    VkPipelineCreateInfoKHR ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_INFO_KHR, .pNext = (void *)pci};
+    VkPipelineBinaryKeyKHR k = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
+    if (PB.key(P.device, &ci, &k) != VK_SUCCESS || !k.keySize || k.keySize > VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR) return 0;
+    char hex[2 * VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR + 1];
+    pb_hex(k.key, k.keySize, hex);
+    return snprintf(path, cap, "%s/%s.bin", PB.dir, hex) < (int)cap;
+}
+
+// File: u32 magic, u32 count, then per binary u32 key size, 32 key bytes, u64 data size, data.
+// A graphics pipeline (gi) or a compute one (cci, gi NULL).
+static VkPipeline pb_load(VkGraphicsPipelineCreateInfo *gi, VkComputePipelineCreateInfo *cci, const char *path) {
+    uint64_t size = 0;
+    uint8_t *f = plat_file_read(path, &size);
+    if (!f) return VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    VkPipelineBinaryKeyKHR keys[PB_MAX];
+    VkPipelineBinaryDataKHR datas[PB_MAX];
+    uint32_t magic = 0, count = 0, n = 0;
+    uint64_t o = 8;
+    if (size >= 8) memcpy(&magic, f, 4), memcpy(&count, f + 4, 4);
+    if (magic != PB_MAGIC || !count || count > PB_MAX) goto out;
+    for (; n < count; n++) {
+        uint32_t ks;
+        uint64_t ds;
+        if (o + 4 + VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR + 8 > size) goto out;
+        memcpy(&ks, f + o, 4), o += 4;
+        if (!ks || ks > VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR) goto out;
+        keys[n] = (VkPipelineBinaryKeyKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR, .keySize = ks};
+        memcpy(keys[n].key, f + o, VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR), o += VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR;
+        memcpy(&ds, f + o, 8), o += 8;
+        if (!ds || ds > size - o) goto out;
+        datas[n] = (VkPipelineBinaryDataKHR){.dataSize = (size_t)ds, .pData = f + o};
+        o += ds;
+    }
+    {
+        VkPipelineBinaryKeysAndDataKHR kd = {.binaryCount = n, .pPipelineBinaryKeys = keys, .pPipelineBinaryData = datas};
+        VkPipelineBinaryCreateInfoKHR bci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR, .pKeysAndDataInfo = &kd};
+        VkPipelineBinaryKHR bins[PB_MAX];
+        VkPipelineBinaryHandlesInfoKHR hi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR,
+                                             .pipelineBinaryCount = n, .pPipelineBinaries = bins};
+        if (PB.create(P.device, &bci, NULL, &hi) == VK_SUCCESS) {
+            const void **pn = gi ? &gi->pNext : &cci->pNext;
+            VkPipelineBinaryInfoKHR bi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR, .pNext = *pn,
+                                          .binaryCount = hi.pipelineBinaryCount, .pPipelineBinaries = bins};
+            const void *chain = *pn;
+            *pn = &bi;
+            VkResult cr = gi ? vkCreateGraphicsPipelines(P.device, VK_NULL_HANDLE, 1, gi, NULL, &pipe)
+                             : vkCreateComputePipelines(P.device, VK_NULL_HANDLE, 1, cci, NULL, &pipe);
+            if (cr != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+            *pn = chain;
+            for (uint32_t i = 0; i < hi.pipelineBinaryCount; i++) PB.destroy(P.device, bins[i], NULL);
+        }
+    }
+out:
+    free(f);
+    return pipe;
+}
+
+static void pb_release(VkPipeline pipe) {
+    VkReleaseCapturedPipelineDataInfoKHR ri = {.sType = VK_STRUCTURE_TYPE_RELEASE_CAPTURED_PIPELINE_DATA_INFO_KHR, .pipeline = pipe};
+    PB.release(P.device, &ri, NULL);
+}
+
+// pipe was created with VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR: its binaries go to path, then the data is released.
+static int pb_save(VkPipeline pipe, const char *path) {
+    int ok = 0;
+    VkPipelineBinaryCreateInfoKHR bci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR, .pipeline = pipe};
+    VkPipelineBinaryHandlesInfoKHR hi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
+    VkPipelineBinaryKHR bins[PB_MAX];
+    uint32_t n = 0;
+    if (PB.create(P.device, &bci, NULL, &hi) == VK_SUCCESS && hi.pipelineBinaryCount && hi.pipelineBinaryCount <= PB_MAX) {
+        hi.pPipelineBinaries = bins;
+        if (PB.create(P.device, &bci, NULL, &hi) == VK_SUCCESS) n = hi.pipelineBinaryCount;
+    }
+    uint8_t *buf = NULL;
+    size_t len = 8, cap = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        VkPipelineBinaryDataInfoKHR di = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_DATA_INFO_KHR, .pipelineBinary = bins[i]};
+        VkPipelineBinaryKeyKHR k = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
+        size_t ds = 0;
+        if (PB.data(P.device, &di, &k, &ds, NULL) != VK_SUCCESS || !ds) goto done;
+        size_t need = len + 4 + VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR + 8 + ds;
+        if (need > cap) {
+            uint8_t *nb = realloc(buf, need * 2);
+            if (!nb) goto done;
+            buf = nb, cap = need * 2;
+        }
+        uint8_t *p = buf + len;
+        uint64_t ds64 = ds;
+        if (PB.data(P.device, &di, &k, &ds, p + 4 + VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR + 8) != VK_SUCCESS) goto done;
+        memcpy(p, &k.keySize, 4);
+        memcpy(p + 4, k.key, VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR);
+        memcpy(p + 4 + VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR, &ds64, 8);
+        len = need;
+    }
+    if (n && buf) {
+        uint32_t magic = PB_MAGIC;
+        memcpy(buf, &magic, 4), memcpy(buf + 4, &n, 4);
+        ok = plat_file_write_atomic(path, buf, len);
+    }
+done:
+    free(buf);
+    for (uint32_t i = 0; i < n; i++) PB.destroy(P.device, bins[i], NULL);
+    pb_release(pipe);
+    return ok;
+}
+#else
+static struct { uint32_t save_ms; volatile int32_t loaded, saved, refused; } PB;
+static int pb_on(void) { return 0; }
+static int pb_path(const void *pci, char *path, size_t cap) { (void)pci, (void)path, (void)cap; return 0; }
+static VkPipeline pb_load(VkGraphicsPipelineCreateInfo *gi, VkComputePipelineCreateInfo *cci, const char *path) {
+    (void)gi, (void)cci, (void)path;
+    return VK_NULL_HANDLE;
+}
+static void pb_release(VkPipeline pipe) { (void)pipe; }
+static int pb_save(VkPipeline pipe, const char *path) { (void)pipe, (void)path; return 0; }
+#endif
+
 // pipeline-crash.txt next to pipeline-keys.bin: the crash note of each graphics or compute pipeline the driver crashed in
 // (platform last-chance filter), a line per crash. An RX 6750 XT crashed in amdvlk64.dll building a mesh pipeline
 // early in play. Crashed once: built without optimization (a mesh pipeline: not built). Twice: not built, its draws
@@ -2455,6 +2837,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     }
     uint64_t p0 = perf_begin();
     static _Thread_local char note[200];   // named in the log if the driver crashes in this create (platform last-chance filter)
+    uint64_t total_words = 0;
     {
         const GfxShader *st[4] = {s->ts, s->vs, s->gs, s->fs};
         int at = snprintf(note, sizeof note, "graphics pipeline, mesh %d task %d:", mesh_vs(s), s->ts != NULL);
@@ -2462,16 +2845,30 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             uint64_t w = 0, h = 1469598103934665603ull;   // FNV-1a of the SPIR-V: the same shader across runs
             const uint32_t *c = st[i] ? gfx_shader_spirv(st[i], &w) : NULL;
             for (uint64_t j = 0; c && j < w; j++) h = (h ^ c[j]) * 1099511628211ull;
+            if (c) total_words += w;
             if (c) at += snprintf(note + at, sizeof note - at, " %s %llu words %016llx", (const char *[]){"ts", "vs", "gs", "fs"}[i],
                                   (unsigned long long)w, (unsigned long long)h);
         }
     }
+    // TOTK_PIPE_NOOPT_WORDS=<n> (0 = off): pipelines whose stages total n SPIR-V words or more are built without
+    // optimization. AMD's Windows compiler took minutes for a few of Ocarina's pipelines and kept none of them in its
+    // caches, so every boot and every first visit waited for them again (RX 5500 XT, driver 26.10.1).
+    static uint64_t noopt_words = ~0ull;
+    if (noopt_words == ~0ull) {
+        const char *e = getenv("TOTK_PIPE_NOOPT_WORDS");
+        noopt_words = e && *e ? strtoull(e, NULL, 0) : vk_caps.amd_sc ? PIPE_NOOPT_WORDS_AMD : 0;
+        if (noopt_words) rt_log("vk_pipeline: graphics pipelines of %llu SPIR-V words or more are built without optimization",
+                                (unsigned long long)noopt_words);
+    }
+    int noopt = noopt_words && total_words >= noopt_words;
+    if (noopt) pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
     int crashes = crash_count(note);
     // A mesh pipeline is skipped after one crash: AMD's driver (amdvlk64.dll+0xf3c1af on an RX 9070 XT, #153, #157)
     // crashed in the same mesh pipeline without optimization too, so the game only started on the third try.
     if (crashes >= (mesh_vs(s) ? 1 : 2)) {
         static volatile int32_t told;
         if (plat_inc32(&told) <= 8) rt_log("vk_pipeline: not built, the driver crashed in it before: %s", note);
+        perf_end(PERF_PIPE, p0);
         goto out;
     }
     if (crashes) {
@@ -2495,20 +2892,72 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         if (!opt && gwords >= (uint64_t)big_cs_words() && l->n >= (uint32_t)min_b) pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
     }
     if (gfx_probe) pi.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
-    uint64_t g0 = plat_now_ns();
+    uint64_t g0 = plat_now_ns(), c0 = g0;
     plat_crash_note(note);
-    int shared = cache && cache == P.cache;
-    if (shared) plat_mutex_lock_shared(&cache_access);
-    VkResult r = vkCreateGraphicsPipelines(P.device, cache, 1, &pi, NULL, &pipe);
-    // AMD's compiler gives up on large programs (-1, out of host memory, on an RX 6750 XT: the scene stayed black at
-    // 1 fps). Built again without optimization, as NotRexed/Hookshot's RX_VK_NOOPT does; NVIDIA never gets here.
-    if (r != VK_SUCCESS && r != VK_PIPELINE_COMPILE_REQUIRED && vk_caps.amd && !(pi.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {
-        pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
-        r = vkCreateGraphicsPipelines(P.device, cache, 1, &pi, NULL, &pipe);
-        rt_log("vk_pipeline: graphics pipeline built again without optimization: %s", r == VK_SUCCESS ? "ok" : "failed too");
+    // Pipeline binaries (above): a kept one is created without compiling; otherwise the compile captures its data so a
+    // slow one can be kept. A probe of the cache does neither.
+    char pbp[PLAT_PATH_MAX * 2 + 160];
+    int pbk = !gfx_probe && !noopt && !crashes && pb_on() && pb_path(&pi, pbp, sizeof pbp), from_bin = 0;
+    VkResult r = VK_ERROR_UNKNOWN;
+    if (pbk && plat_file_exists(pbp)) {
+        pipe = pb_load(&pi, NULL, pbp);
+        if (pipe) r = VK_SUCCESS, from_bin = 1, plat_inc32(&PB.loaded);
+        else if (plat_inc32(&PB.refused) <= 8) rt_log("vk_pipeline: pipeline binary refused, compiling: %s", pbp);
     }
-    if (shared) plat_mutex_unlock_shared(&cache_access);
+    int big = big_pipeline(total_words) && !gfx_probe;
+    if (!from_bin && !gfx_probe && big_defer(total_words, "graphics pipeline")) {
+        plat_crash_note(NULL);
+        perf_end(PERF_PIPE, p0);
+        pipe = VK_NULL_HANDLE;
+        goto out;
+    }
+    int fallback = 0;   // built without optimization after the optimized build failed: never kept (below)
+    if (!from_bin) {
+        VkPipelineCreateFlags2CreateInfoKHR f2 = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR,
+                                                  .pNext = pi.pNext,
+                                                  .flags = (VkPipelineCreateFlags2KHR)pi.flags | VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR};
+        if (pbk) pi.pNext = &f2;
+        mg_enter(big);
+        if (big) {   // jogar\preparar-shaders.ps1 shows it
+            c0 = plat_now_ns();   // the compile alone, not the wait for the gate
+            rt_log("vk_pipeline: compiling a big graphics pipeline: %llu words", (unsigned long long)total_words);
+        }
+        VkPipelineCache build_cache = pbk ? VK_NULL_HANDLE : cache;   // Vulkan requires VK_NULL_HANDLE with the capture flag
+        int shared = build_cache && build_cache == P.cache;
+        if (shared) plat_mutex_lock_shared(&cache_access);
+        r = vkCreateGraphicsPipelines(P.device, build_cache, 1, &pi, NULL, &pipe);
+        // AMD's compiler gives up on large programs (-1, out of host memory, on an RX 6750 XT: the scene stayed black at
+        // 1 fps). Built again without optimization, as NotRexed/Hookshot's RX_VK_NOOPT does; NVIDIA never gets here.
+        if (r != VK_SUCCESS && r != VK_PIPELINE_COMPILE_REQUIRED && vk_caps.amd &&
+            !(pi.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {
+            VkResult first = r;
+            pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+            f2.flags |= VK_PIPELINE_CREATE_2_DISABLE_OPTIMIZATION_BIT_KHR;   // when chained, f2's flags replace pi.flags
+            r = vkCreateGraphicsPipelines(P.device, build_cache, 1, &pi, NULL, &pipe);
+            fallback = 1;
+            rt_log("vk_pipeline: graphics pipeline built again without optimization: %s (%d, then %d): %s",
+                   r == VK_SUCCESS ? "ok" : "failed too", (int)first, (int)r, note);
+        }
+        if (shared) plat_mutex_unlock_shared(&cache_access);
+        mg_leave(big);
+        if (pbk) pi.pNext = f2.pNext;
+    }
     plat_crash_note(NULL);
+    double c_s = (double)(plat_now_ns() - c0) / 1e9;
+    if (pbk && !from_bin && r == VK_SUCCESS && pipe) {
+        // pbp is the optimized build's name, and the slower fallback must not load from it on every later start.
+        if (!fallback && c_s * 1000.0 >= PB.save_ms) {
+            int ok = pb_save(pipe, pbp);
+            if (ok) plat_inc32(&PB.saved);
+            rt_log("vk_pipeline: pipeline binary %s after a %.1f s compile: %s", ok ? "kept" : "NOT kept", c_s, pbp);
+        } else {
+            pb_release(pipe);
+        }
+    }
+    if (from_bin && __atomic_load_n(&PB.loaded, __ATOMIC_RELAXED) <= 8)
+        rt_log("vk_pipeline: pipeline created from its binary in %.1f ms, %llu words", c_s * 1000.0, (unsigned long long)total_words);
+    if (c_s >= 3.0) rt_log("vk_pipeline: slow graphics pipeline: %.1f s%s, %llu words; %s", c_s, noopt ? " (unoptimized)" : "",
+                           (unsigned long long)total_words, note);
     perf_end(PERF_PIPE, p0);   // counts on the render thread only, so background builds stay out of it
     {
         double gs_ = (double)(plat_now_ns() - g0) / 1e9;
@@ -2608,6 +3057,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
     VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     uint32_t *patched = NULL;
     VkPipeline pipe = VK_NULL_HANDLE;
+    uint64_t stage_words = 0;   // the shader's own size, for big_pipeline
     if (kind == LIB_VI) {
         if (!P.dyn_vi) {
             VtxInput v;
@@ -2624,7 +3074,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         const PrKey *pk = key;
         uint64_t vw, sw, n2 = 0;
         const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw), *scode = vcode;
-        sw = vw;
+        sw = vw, stage_words = vw;
         if (pk->missing && (patched = spirv_add_outputs(vcode, vw, pk->missing, pk->fin, &n2))) vcode = patched, vw = n2;
         else if (pk->missing) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", pk->missing);
         if (!(m = make_module(vcode, vw))) goto out;
@@ -2636,7 +3086,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         if (s->fs) {
             uint64_t fw, sw, n2 = 0;
             const uint32_t *fcode = fs_spirv_over(s->fs, &fw), *scode = fcode;
-            sw = fw;
+            sw = fw, stage_words = fw;
             uint32_t *d = NULL, *at = NULL;
             if (k->alpha && fcode) {   // before spirv_dual_source, which adds a second output at Location 0
                 if ((at = spirv_alpha_test(fcode, fw, k->alpha, k->alpha_ref, &n2))) fcode = at, fw = n2;
@@ -2671,9 +3121,13 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         ri.depthAttachmentFormat = (VkFormat)k->depth, ri.stencilAttachmentFormat = (VkFormat)k->stencil;
         pi.pColorBlendState = &cb, pi.pMultisampleState = &ms;
     }
+    int big = big_pipeline(stage_words);
+    if (big && big_defer(stage_words, kind == LIB_FS ? "fragment shader library" : "vertex shader library")) goto out;
+    mg_enter(big);
     plat_mutex_lock_shared(&cache_access);
     if (vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
     plat_mutex_unlock_shared(&cache_access);
+    mg_leave(big);
 out:
     if (m) vkDestroyShaderModule(P.device, m, NULL);
     free(patched);
@@ -2907,7 +3361,7 @@ typedef struct Job {
     GKey k;
 } Job;
 
-#define MAX_WORKERS 4
+#define MAX_WORKERS 8
 
 static struct {
     int on;                            // set once by vk_pipeline_async_enable, before the replay runs
@@ -3201,6 +3655,7 @@ static void pipe_worker(void *arg) {
         }
         plat_mutex_unlock(&P.lock);
         VkPipeline pipe = VK_NULL_HANDLE;
+        int deferred = 0;
         if (j->large && !j->probed) {   // LOCAL TEST (Ocarina, AMD): in the cache? (see low_pick)
             double t0 = now_ms();
             gfx_probe = 1;
@@ -3228,7 +3683,9 @@ static void pipe_worker(void *arg) {
             // As with the big compute worker, do not hold the shared driver
             // cache during a large compilation.
             VkPipelineCache own = j->large ? cache_private() : VK_NULL_HANDLE;
+            tl_deferred = 0;
             pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off, own ? own : P.cache);
+            deferred = !pipe && tl_deferred;
             if (own) {
                 if (pipe) cache_publish(own);
                 else vkDestroyPipelineCache(P.device, own, NULL);
@@ -3243,6 +3700,8 @@ static void pipe_worker(void *arg) {
         if (pipe) {
             P.stats.graphics++, P.stats.async_built++;
             if (!j->prebuild && !j->large) keys_note(&j->s);
+        } else if (deferred) {
+            keys_note(&j->s);   // the next start's prewarm builds it (big compiles)
         } else {
             P.stats.failures++;
             rt_log("vk_pipeline: graphics pipeline not built: pipeline creation failed");
@@ -3262,16 +3721,26 @@ static void pipe_worker(void *arg) {
     return;
 }
 
-// Starts the pool on first use: a quarter of the logical processors, 2 to 4. Caller holds P.lock.
+// Starts the pool on first use: a quarter of the logical processors, 2 to 4; on AMD half of them, 2 to MAX_WORKERS
+// (its Windows compiler takes seconds to minutes per pipeline, and the game leaves most cores idle), but no more
+// than one per 8 GB of RAM: that compiler takes gigabytes per big pipeline, and six at once used up a 16 GB PC
+// (see the compile memory gate). TOTK_PIPE_WORKERS=<n> sets it. Caller holds P.lock.
 static int workers_start(void) {
     if (A.threads) return 1;
     uint32_t cpus = plat_cpu_usable();
-    int n = cpus / 4 < 2 ? 2 : cpus / 4 > MAX_WORKERS ? MAX_WORKERS : (int)(cpus / 4);
+    int cap = amd_keeps_binaries() ? MAX_WORKERS : 4;   // the room for 8 is for that driver only: elsewhere the limit stays 4
+    int n = cpus / 4 < 2 ? 2 : cpus / 4 > (uint32_t)cap ? cap : (int)(cpus / 4);
+    if (amd_keeps_binaries()) {
+        n = cpus / 2 < 2 ? 2 : cpus / 2 > (uint32_t)cap ? cap : (int)(cpus / 2);
+        if (n > mg_compilers_by_ram()) n = mg_compilers_by_ram();
+    }
+    const char *we = getenv("TOTK_PIPE_WORKERS");
+    if (we && atoi(we) > 0) n = atoi(we) > cap ? cap : atoi(we);
     {   // LOCAL TEST (Ocarina, AMD): OOT_PIPE_WORKERS overrides the count. On AMD the big jobs are serialized on worker 0
         // (head_pick), so the default count stays.
         const char *e = getenv("OOT_PIPE_WORKERS");
         if (e && *e) n = atoi(e);
-        n = n < 1 ? 1 : n > MAX_WORKERS ? MAX_WORKERS : n;
+        n = n < 1 ? 1 : n > cap ? cap : n;
     }
     for (int i = 0; i < n; i++) {
         PlatThread *t = plat_thread_new(pipe_worker, (void *)(intptr_t)A.threads, "pipe worker");
@@ -3376,15 +3845,18 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
         *j = (Job){.l = l, .fs_off = fs_off, .low = mode == 2 || large, .prebuild = mode == 2,
                    .large = large, .probed = !probe_on || (getenv("OOT_PIPE_PROBE") && !strcmp(getenv("OOT_PIPE_PROBE"), "0")),
                    .big = vk_caps.amd && words >= big_cs_words(), .worker = -1, .s = *s, .k = *k};
-    } else if (!why && !(pipe = create_graphics(s, k, l, fs_off, P.cache))) {
-        why = "pipeline creation failed";
+    } else if (!why) {
+        tl_deferred = 0;
+        tl_holds_plock = 1;
+        if (!(pipe = create_graphics(s, k, l, fs_off, P.cache)) && !tl_deferred) why = "pipeline creation failed";
+        tl_holds_plock = 0;
     }
     if (why) {
         P.stats.failures++;
         rt_log("vk_pipeline: graphics pipeline not built: %s", why);
     } else if (!j) {
-        P.stats.graphics++;
-        if (mode != 2) keys_note(s);
+        if (pipe) P.stats.graphics++;
+        if (mode != 2) keys_note(s);   // a big compile left for the next start (tl_deferred) is recorded too
     }
     Pipe *p = pipe_add(k, sizeof *k, h, pipe, l, l ? &B : NULL, VK_PIPELINE_BIND_POINT_GRAPHICS, gfx_shader_inputs(s->vs, NULL));
     if (!j || !p) {
@@ -3511,6 +3983,16 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
                : U.on ? "has its libraries built in parallel on the workers, ahead of other jobs"
                       : "builds its libraries itself (TOTK_PIPE_WAIT=draw)");
     }
+    // TOTK_PIPE_WAIT_ONCE (default 1 with amd_keeps_binaries, 0 elsewhere): once a draw's wait for a pipeline ran out, later draws with it skip at once until
+    // it is built. AMD's Windows compiler took minutes for some of Ocarina's pipelines; hundreds of one-shot draws at
+    // the first area waited a second each for the same few pipelines and were skipped anyway, freezing the picture for
+    // minutes (RX 5500 XT, driver 26.10.1).
+    static int wait_once = -1;
+    if (wait_once < 0) {
+        const char *e = getenv("TOTK_PIPE_WAIT_ONCE");
+        wait_once = e && *e ? strcmp(e, "0") != 0 : amd_keeps_binaries();
+    }
+    if (wait_ms && wait_once && p && p->waited_out && p->building && !p->info.pipeline) wait_ms = 0;
     double end = wait_ms ? now_ms() + wait_ms : 0;
     // An ordinary full-screen wait is at most 50 ms. If a one-shot wait
     // times out, later frames can keep drawing with the available pipelines
@@ -3553,6 +4035,7 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
         double now;
         while (p->building && !p->info.pipeline && wait_ms && (now = now_ms()) < end)
             plat_cond_wait_ms(&done_cv, &P.lock, (uint32_t)(end - now) + 1);
+        if (wait_ms && p->building && !p->info.pipeline) p->waited_out = 1;
         if (wait_ms) perf_end(PERF_PIPE, p0);
         if (wait_ms && !p->building) perf_count(PERF_CNT_PIPE_WAIT);
     }
@@ -3593,7 +4076,9 @@ static void warm_builder(void *arg) {
         j->next = j->prev = NULL;
         j->low = 0;                    // not on a pool thread: promote() has nothing to raise
         plat_mutex_unlock(&P.lock);
+        tl_deferred = 0;
         VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off, P.cache);
+        int deferred = !pipe && tl_deferred;   // the guest started meanwhile (TOTK_PREWARM_WAIT_MS ran out)
         plat_mutex_lock(&P.lock);
         if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
         if (pipe && j->p->fast) P.g.swaps++;
@@ -3601,6 +4086,8 @@ static void warm_builder(void *arg) {
         j->p->job = NULL;
         if (pipe) {
             P.stats.graphics++, P.stats.async_built++, K.built++;
+        } else if (deferred) {
+            K.failed++;   // its record stays in the key file for the next start
         } else {
             P.stats.failures++, K.failed++;
             rt_log("vk_pipeline: graphics pipeline not built: pipeline creation failed");
@@ -3631,6 +4118,14 @@ void vk_pipeline_prewarm(void) {
         rt_log("vk_pipeline: prewarm: no pipeline keys (%s)", K.path[0] ? K.path : "<none>");
         if (P.ready) lb_start(pr_hist, fs_hist);
         return;
+    }
+    {   // jogar-ocarina.ps1 runs TOTK_PREWARM_ONLY on every AMD card: without binaries to keep, it would compile everything
+        // at every start for nothing. After ensure_init, which drops the records unless K.warm is set.
+        const char *only = getenv("TOTK_PREWARM_ONLY");
+        if (only && !strcmp(only, "1") && !amd_keeps_binaries()) {
+            rt_log("vk_pipeline: prewarm only: this driver keeps no pipeline binaries, nothing to prepare");
+            return;
+        }
     }
     const KeyRec *r = (const KeyRec *)K.file;
     size_t n = K.file_n, m = 0;
@@ -3685,9 +4180,10 @@ void vk_pipeline_prewarm(void) {
         }
         {   // LOCAL TEST (Ocarina, AMD): a big (guarded) pipeline is left to play: built here on every core at once they
             // held the boot for 15 minutes and ran the driver out of memory. OOT_PREWARM_BIG=1 builds them here.
+            // RDNA 1/2: the prepared binaries and big_defer handle these.
             static int big = -1;
             if (big < 0) big = getenv("OOT_PREWARM_BIG") != NULL;
-            if (!big && A.on && vk_caps.amd && graphics_shader_words(vs) + graphics_shader_words(fs) + graphics_shader_words(ts) >= big_cs_words()) {
+            if (!big && A.on && vk_caps.amd && !amd_keeps_binaries() && graphics_shader_words(vs) + graphics_shader_words(fs) + graphics_shader_words(ts) >= big_cs_words()) {
                 if (dr) dr[deferred] = (struct DeferRec){i, vs, fs, ts};
                 deferred++;
                 continue;
@@ -3711,7 +4207,12 @@ void vk_pipeline_prewarm(void) {
 
     PlatThread *t[64];
     int nt = 0;
-    for (int i = 0; i < cpus && i < 64 && queued; i++)
+    // On AMD two per 8 GB of RAM: a record without a pipeline binary (a new driver) compiles, and that takes gigabytes
+    // (compile memory gate). TOTK_PREWARM_ONLY (the game closed) uses every core: the gate keeps the RAM.
+    int wt = cpus;
+    const char *po = getenv("TOTK_PREWARM_ONLY");
+    if (amd_keeps_binaries() && !(po && !strcmp(po, "1")) && wt > 2 * mg_compilers_by_ram()) wt = 2 * mg_compilers_by_ram();
+    for (int i = 0; i < wt && i < 64 && queued; i++)
         if ((t[nt] = plat_thread_new(warm_builder, NULL, "pipe prewarm"))) nt++;
     if (!nt) warm_builder(NULL);
     for (int i = 0; i < nt; i++)
@@ -3826,19 +4327,75 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
         rt_log("vk_pipeline: built without optimization, the driver crashed in it before: %s", note);
     }
     VkPipeline pipe = VK_NULL_HANDLE;
-    plat_crash_note(note);
-    if (!cs_build_cache) plat_mutex_lock_shared(&cache_access);
-    if (vkCreateComputePipelines(P.device, cs_build_cache ? cs_build_cache : P.cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
-    if (!pipe && vk_caps.amd && !(ci.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {   // as for graphics, above
-        ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
-        if (vkCreateComputePipelines(P.device, cs_build_cache ? cs_build_cache : P.cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
-        rt_log("vk_pipeline: compute pipeline built again without optimization: %s", pipe ? "ok" : "failed too");
+    plat_crash_note(note);   // also over pb_load: a driver crash loading a binary must not repeat at every start
+    // Pipeline binaries (see graphics pipelines): neither the driver's disk cache nor ours kept the big compute shaders on
+    // AMD, so each run compiled them again, for minutes and gigabytes (130,000-166,000 words at the first area, RX 5500 XT,
+    // driver 26.10.1). A kept one is created in milliseconds. One the driver crashed in takes the normal path (crash_count).
+    char pbp[PLAT_PATH_MAX * 2 + 160];
+    int pbk = !crashes && pb_on() && pb_path(&ci, pbp, sizeof pbp);
+    // The driver's key need not cover the flag: a big shader built with the optimizer must not load a binary kept from a
+    // build without it, which ran slower. Those stay on the disk, unused.
+    if (pbk && !(ci.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) && words >= big_cs_words()) {
+        size_t pn = strlen(pbp);
+        if (pn > 4 && pn + 4 < sizeof pbp) strcpy(pbp + pn - 4, ".opt.bin");
     }
-    if (!cs_build_cache) plat_mutex_unlock_shared(&cache_access);
+    if (pbk && plat_file_exists(pbp)) {
+        if ((pipe = pb_load(NULL, &ci, pbp))) plat_inc32(&PB.loaded);
+        else if (plat_inc32(&PB.refused) <= 8) rt_log("vk_pipeline: pipeline binary refused, compiling: %s", pbp);
+    }
+    // Background-built ones (big_cs_words, 32,768 words) count as big for the gate: one at a time. A 79,000-word one
+    // took 3 GB in 20 s at the preparation, and twelve threads started several at once.
+    int big = big_pipeline(words) || (amd_keeps_binaries() && words >= big_cs_words());
+    if (!pipe && big_defer(words, "compute shader")) {   // big compiles left for the next start: its dispatches stay skipped
+        plat_crash_note(NULL);
+        vkDestroyShaderModule(P.device, m, NULL);
+        return VK_NULL_HANDLE;
+    }
+    if (!pipe) {
+        VkPipelineCreateFlags2CreateInfoKHR f2 = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR,
+                                                  .pNext = ci.pNext,
+                                                  .flags = (VkPipelineCreateFlags2KHR)ci.flags | VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR};
+        if (pbk) ci.pNext = &f2;
+        mg_enter(big);
+        uint64_t c0 = plat_now_ns();
+        if (big) rt_log("vk_pipeline: compiling a big compute shader: %llu words", (unsigned long long)words);
+        // A capturing compile takes no pipeline cache (Vulkan requires VK_NULL_HANDLE with the capture flag).
+        VkPipelineCache build_cache = pbk ? VK_NULL_HANDLE : cs_build_cache ? cs_build_cache : P.cache;
+        int shared = build_cache && build_cache == P.cache;
+        if (shared) plat_mutex_lock_shared(&cache_access);
+        if (vkCreateComputePipelines(P.device, build_cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+        int fallback = 0;   // built without optimization after the optimized build failed: never kept (below)
+        if (!pipe && vk_caps.amd && !(ci.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {   // as for graphics, above
+            ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+            f2.flags |= VK_PIPELINE_CREATE_2_DISABLE_OPTIMIZATION_BIT_KHR;
+            if (vkCreateComputePipelines(P.device, build_cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+            fallback = 1;
+            rt_log("vk_pipeline: compute pipeline built again without optimization: %s", pipe ? "ok" : "failed too");
+        }
+        if (shared) plat_mutex_unlock_shared(&cache_access);
+        mg_leave(big);
+        if (pbk) ci.pNext = f2.pNext;
+        double c_s = (double)(plat_now_ns() - c0) / 1e9;
+        if (pbk && pipe) {
+            // pbp is the optimized build's name: the slower fallback must not load from it on every later start. Below
+            // TOTK_PIPE_BINARY_MS (default 0 here) a pipeline compiles again next start: a capturing compile is not in the cache.
+            if (!fallback && c_s * 1000.0 >= PB.save_ms) {
+                int ok = pb_save(pipe, pbp);
+                if (ok) plat_inc32(&PB.saved);
+                if (!ok || c_s >= 1.0)
+                    rt_log("vk_pipeline: compute pipeline binary %s after a %.1f s compile, %llu words", ok ? "kept" : "NOT kept",
+                           c_s, (unsigned long long)words);
+            } else {
+                pb_release(pipe);
+            }
+        }
+    }
     plat_crash_note(NULL);
     vkDestroyShaderModule(P.device, m, NULL);
     return pipe;
 }
+
+int vk_pipeline_keeps_binaries(void) { return P.ready ? amd_keeps_binaries() : -1; }
 
 // The layout of a compute shader in *B; NULL with *why on failure. Caller holds P.lock.
 static Layout *compute_layout(const GfxShader *cs, Bindings *B, const char **why) {
@@ -3890,13 +4447,77 @@ static struct {
 } LB = {.stat = PLAT_MUTEX_INIT};
 
 // LOCAL TEST (Ocarina): compute shaders with guarded candidates reach 17-30 MB of SPIR-V; the driver takes a minute or more and over 30 GB
-// for one, and it ran on the replay thread under P.lock: the game froze at the first broken pot. A big shader is built here first, one at a
-// time, so memory stays bounded, and its dispatches are skipped until the pipeline is in the live table.
-// ponytail: a linear table of 1024 shaders and a polling worker; a dispatch skipped this way loses its effect for those frames.
-enum { BIG_CS_N = 1024 };
-static struct { const GfxShader *cs; volatile int done; uint64_t words; int started; } big_cs[BIG_CS_N];
+// for one, and it ran on the replay thread under P.lock: the game froze at the first broken pot. A big shader is built here first, by
+// big_cs_workers() threads, and its dispatches are skipped until the pipeline is in the live table.
+// Each worker takes the smallest queued shader, and at most one of them builds a huge one (big_cs_huge_words()) at a time, so memory
+// stays bounded and a huge build never holds the others. One worker taking the queue in order let a 346,302-word Kokiri shader
+// (c968ad44272dcbb4, 504 s on NVIDIA 621.01) hold every big shader met after it: the exposure (435a0138b9013040) and volumetric fog
+// (ee7764a6b1ef459c, 27ee9883e2a20323) passes and the falling leaves were skipped for the whole of a first session after an update
+// (washed-out picture, leaves still in the air, #167).
+// ponytail: a linear table of 8192 shaders and polling workers; a dispatch skipped this way loses its effect for those frames.
+// TOTK_ASYNC_CS_WORDS (default: the big-shader size; opt-in lower, e.g. 1024 on AMD): compute shaders of at least this many words
+// go through the same background build, so the replay thread never compiles one under P.lock. AMD's Windows compiler took
+// seconds to minutes for medium-sized shaders that NVIDIA builds in milliseconds, and the game froze for minutes at the
+// first area (RX 5500 XT, driver 26.10.1). Only big shaders (big_cs_words) are built without optimization. Medium shaders
+// get ASYNC_CS_MEDIUM workers of their own, so they do not queue behind a giant one.
+enum { BIG_CS_N = 8192, BIG_CS_MAX_THREADS = 4, ASYNC_CS_MEDIUM = 2 };
+enum { BIG_CS_QUEUED, BIG_CS_BUILDING, BIG_CS_DONE };
+static struct { const GfxShader *cs; uint64_t words; volatile int state; uint8_t big; } big_cs[BIG_CS_N];
 static volatile int big_cs_n;
 static int big_cs_thread;
+static PlatMutex big_cs_lock = PLAT_MUTEX_INIT;   // big_cs[].state from BIG_CS_QUEUED, big_cs_huge_busy
+static int big_cs_huge_busy;
+
+// OOT_BIG_CS_THREADS: workers building big compute shaders (at most BIG_CS_MAX_THREADS). Default 2 with 24 GB of RAM or more,
+// else 1: the 346,302-word shader alone took 5.9 GB of RAM for 504 s (RTX 4090, driver 621.01), and the README's minimum is 16 GB.
+static int big_cs_workers(void) {
+    static int n;
+    if (!n) {
+        const char *e = getenv("OOT_BIG_CS_THREADS");
+        float used = 0, total = 0, proc = 0;
+        if (!e) plat_mem_info(&used, &total, &proc);
+        int v = e ? atoi(e) : total >= 24.0f * 1024 ? 2 : 1;
+        n = v < 1 ? 1 : v > BIG_CS_MAX_THREADS ? BIG_CS_MAX_THREADS : v;
+    }
+    return n;
+}
+
+// OOT_BIG_CS_HUGE: SPIR-V words from which a big compute shader counts as huge: one worker at a time builds those (default 262144;
+// Kokiri meets 346-393 K word shaders, the rest are 33-260 K).
+static uint64_t big_cs_huge_words(void) {
+    static uint64_t w;
+    if (!w) {
+        const char *e = getenv("OOT_BIG_CS_HUGE");
+        w = e && strtoull(e, NULL, 0) ? strtoull(e, NULL, 0) : 262144;
+    }
+    return w;
+}
+
+// The queued shader a worker builds next: the smallest, skipping huge ones while another worker builds one, and big ones for
+// a medium-only worker. -1: none.
+static int big_cs_take(int medium_only) {
+    int best = -1, n = __atomic_load_n(&big_cs_n, __ATOMIC_ACQUIRE);
+    plat_mutex_lock(&big_cs_lock);
+    for (int i = 0; i < n; i++) {
+        if (__atomic_load_n(&big_cs[i].state, __ATOMIC_RELAXED) != BIG_CS_QUEUED) continue;
+        if (medium_only && big_cs[i].big) continue;
+        if (big_cs_huge_busy && big_cs[i].words >= big_cs_huge_words()) continue;
+        if (best < 0 || big_cs[i].words < big_cs[best].words) best = i;
+    }
+    if (best >= 0) {
+        __atomic_store_n(&big_cs[best].state, BIG_CS_BUILDING, __ATOMIC_RELAXED);
+        if (big_cs[best].words >= big_cs_huge_words()) big_cs_huge_busy = 1;
+    }
+    plat_mutex_unlock(&big_cs_lock);
+    return best;
+}
+
+// A worker is done with shader i (built, failed or left for the next start): another may take a huge one.
+static void big_cs_release(int i) {
+    plat_mutex_lock(&big_cs_lock);
+    if (big_cs[i].words >= big_cs_huge_words()) big_cs_huge_busy = 0;
+    plat_mutex_unlock(&big_cs_lock);
+}
 
 // LOCAL TEST (Ocarina): a copy of the shared cache, for --bench-cs with OOT_BENCH_SEED (play seeds its private caches with
 // cache_private). Falls back to an empty cache.
@@ -3920,29 +4541,26 @@ static VkPipelineCache cache_copy(void) {
     return c;
 }
 
-// The smallest pending shader first: in queue order, Ocarina 1.1.1's movie upscaler (two shaders of ~340k words, minutes
-// each without optimization on an RTX 3070) came before the vegetation culling (156k words), whose dispatches were
-// skipped meanwhile: the plants stood still and dark for minutes after a load. TOTK_BIG_CS_FIFO=1 keeps the queue order.
-static int big_cs_pick(void) {
-    static int fifo = -1;
-    if (fifo < 0) { const char *e = getenv("TOTK_BIG_CS_FIFO"); fifo = e && *e == '1'; }
-    int n = __atomic_load_n(&big_cs_n, __ATOMIC_ACQUIRE), best = -1;
-    for (int i = 0; i < n; i++) {
-        if (big_cs[i].started) continue;
-        if (fifo) return i;
-        if (best < 0 || big_cs[i].words < big_cs[best].words) best = i;
+static uint64_t async_cs_words(void) {
+    static uint64_t w = ~0ull;
+    if (w == ~0ull) {
+        const char *e = getenv("TOTK_ASYNC_CS_WORDS");
+        w = e && *e ? strtoull(e, NULL, 0) : big_cs_words();   // opt-in: a skipped dispatch can leave stale indirect arguments
+        if (!w || w > big_cs_words()) w = big_cs_words();
+        rt_log("vk_pipeline: compute shaders of %llu words or more are built in the background (TOTK_ASYNC_CS_WORDS)",
+               (unsigned long long)w);
     }
-    return best;
+    return w;
 }
 
 static void big_cs_worker(void *arg) {
-    (void)arg;
-    for (int next;;) {
-        if ((next = big_cs_pick()) < 0) {
-            plat_sleep_ms(20);
+    int medium_only = (int)(intptr_t)arg;   // 1: only shaders below big_cs_words
+    for (;;) {
+        int next = big_cs_take(medium_only);
+        if (next < 0) {
+            plat_sleep_ms(5);
             continue;
         }
-        big_cs[next].started = 1;
         const GfxShader *cs = big_cs[next].cs;
         const char *why = NULL;
         Bindings B = {0};
@@ -3955,8 +4573,14 @@ static void big_cs_worker(void *arg) {
         // behind it, and the game froze for over a minute. The result is merged into the shared one when it is done.
         VkPipelineCache own = cache_private();   // upstream v0.2.4: seeded from pipeline-cache.bin
         cs_build_cache = own;
+        tl_deferred = 0;
         VkPipeline pipe = why ? VK_NULL_HANDLE : compute_create(cs, l);
         cs_build_cache = VK_NULL_HANDLE;
+        if (!pipe && tl_deferred) {   // left for the next start (big compiles): not done, so its dispatches stay skipped
+            if (own) vkDestroyPipelineCache(P.device, own, NULL);
+            big_cs_release(next);     // stays BIG_CS_BUILDING: no worker takes it again this run
+            continue;
+        }
         // Kept, as lb_compute keeps its pipelines: built again on the replay thread, the driver's cache missed and the game froze for
         // the whole compile a second time (62 s after big compute shader 31, a 21-minute run).
         int built = pipe != VK_NULL_HANDLE;
@@ -3972,8 +4596,12 @@ static void big_cs_worker(void *arg) {
             plat_mutex_unlock(&P.lock);
             if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
         }
-        rt_log("vk_pipeline: big compute shader %d built in %.1f s%s", next, (double)(plat_now_ns() - t0) / 1e9, built ? "" : " (failed)");
-        __atomic_store_n(&big_cs[next].done, 1, __ATOMIC_RELEASE);
+        double secs = (double)(plat_now_ns() - t0) / 1e9;
+        if (big_cs[next].big || secs >= 1.0 || !built)
+            rt_log("vk_pipeline: %s compute shader %d (%llu words) built in %.1f s%s", big_cs[next].big ? "big" : "background", next,
+                   (unsigned long long)big_cs[next].words, secs, built ? "" : " (failed)");
+        big_cs_release(next);
+        __atomic_store_n(&big_cs[next].state, BIG_CS_DONE, __ATOMIC_RELEASE);
         if (own) {
             if (built) cache_publish(own);
             else vkDestroyPipelineCache(P.device, own, NULL);
@@ -4161,7 +4789,20 @@ int vk_pipeline_warm_big_cs(void) {
     fflush(stdout);
     uint64_t t_all = plat_now_ns();
     int failed = 0;
+    // OOT_WARM_BUDGET_S: no new build starts after that many seconds (the installer sets it; an AMD card took 3 hours for
+    // the list, #188). What is left is built in play as before; the list is smallest first, so the quick ones are done.
+    const char *be = getenv("OOT_WARM_BUDGET_S");
+    double budget = be ? atof(be) : 0;
     for (size_t i = 0; i < m; i++) {
+        double spent = (double)(plat_now_ns() - t_all) / 1e9;
+        if (budget > 0 && spent > budget) {
+            printf("warm-big-cs: time budget of %.0f s reached after %zu of %zu: the %zu left are built in play\n", budget, i, m,
+                   m - i);
+            break;
+        }
+        // "[i/m]": the installer's progress bar reads it (Instalar-Ocarina.ps1 Atualizar)
+        printf("warm-big-cs: [%zu/%zu] building a compute shader of %llu words\n", i + 1, m, (unsigned long long)tw[i]);
+        fflush(stdout);
         Bindings B = {0};
         const char *why = NULL;
         plat_mutex_lock(&P.lock);
@@ -4186,18 +4827,89 @@ int vk_pipeline_compute_ready(const GfxShader *cs) {
     uint64_t words = 0;
     if (!cs || !ensure_init()) return 1;
     gfx_shader_spirv(cs, &words);
-    if (words < big_cs_words()) return 1;
+    if (words < async_cs_words()) return 1;
     int n = __atomic_load_n(&big_cs_n, __ATOMIC_RELAXED);   // only the replay thread adds
     for (int i = 0; i < n; i++)
-        if (big_cs[i].cs == cs) return __atomic_load_n(&big_cs[i].done, __ATOMIC_ACQUIRE);
+        if (big_cs[i].cs == cs) return __atomic_load_n(&big_cs[i].state, __ATOMIC_ACQUIRE) == BIG_CS_DONE;
     if (n == BIG_CS_N) return 1;
-    if (!big_cs_thread) big_cs_thread = plat_thread_spawn(big_cs_worker, NULL, "big compute", 0) ? 1 : -1;
+    if (!big_cs_thread) {
+        int started = 0;
+        for (int i = 0; i < big_cs_workers(); i++)
+            started += plat_thread_spawn(big_cs_worker, (void *)(intptr_t)0, "big compute", 0) != 0;
+        big_cs_thread = started ? started : -1;
+        rt_log("vk_pipeline: %d big compute workers (OOT_BIG_CS_THREADS), smallest first, one huge (%llu+ words, OOT_BIG_CS_HUGE) at a time",
+               started, (unsigned long long)big_cs_huge_words());
+        if (started && async_cs_words() < big_cs_words())
+            for (int i = 0; i < ASYNC_CS_MEDIUM; i++) plat_thread_spawn(big_cs_worker, (void *)(intptr_t)1, "compute builder", 0);
+    }
     if (big_cs_thread < 0) return 1;
-    big_cs[n].cs = cs, big_cs[n].words = words;
+    big_cs[n].cs = cs;
+    big_cs[n].words = words;
+    big_cs[n].big = words >= big_cs_words();
+    __atomic_store_n(&big_cs[n].state, BIG_CS_QUEUED, __ATOMIC_RELAXED);
     __atomic_store_n(&big_cs_n, n + 1, __ATOMIC_RELEASE);
     rt_log("vk_pipeline: big compute shader %d queued (%llu words): its dispatches are skipped until it is built", n,
            (unsigned long long)words);
     return 0;
+}
+
+// TOTK_PREWARM_ONLY (boot.c, after the prewarm): every compute shader play recorded (shader-answers.bin) or prepared
+// that builds in the background (big_cs_words or more), one at a time with the RAM the game would hold, each kept as a
+// pipeline binary; in play they are then created in milliseconds instead of compiled for minutes. Shaders over
+// TOTK_PREP_CS_MAX_WORDS (default 1,000,000) are left out: the guarded ones reach millions of words and over 30 GB.
+static struct {
+    const GfxShader **todo;
+    size_t n;
+    volatile int64_t next;
+    volatile int32_t done, failed;
+    double t0;
+} PC;
+
+static void prep_cs_worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        size_t i = (size_t)plat_inc64(&PC.next) - 1;
+        if (i >= PC.n) return;
+        Bindings B = {0};
+        const char *why = NULL;
+        plat_mutex_lock(&P.lock);
+        Layout *l = compute_layout(PC.todo[i], &B, &why);
+        plat_mutex_unlock(&P.lock);
+        VkPipeline p = why ? VK_NULL_HANDLE : compute_create(PC.todo[i], l);
+        if (p) vkDestroyPipeline(P.device, p, NULL);
+        else plat_inc32(&PC.failed);
+        plat_inc32(&PC.done);
+    }
+}
+
+void vk_pipeline_prep_compute(void) {
+    if (!ensure_init() || !pb_on()) return;
+    GfxWarmEnt *all = NULL;
+    size_t total = gfx_shader_warm_list(&all), n = 0;
+    uint64_t maxw = prep_cs_max_words();
+    const GfxShader **todo = total ? malloc(total * sizeof *todo) : NULL;
+    for (size_t i = 0; todo && i < total; i++) {
+        if (all[i].stage != GFX_STAGE_CS) continue;
+        const GfxShader *sh = gfx_shader_load_input(all[i].iid, 0);
+        uint64_t w = 0;
+        if (sh) gfx_shader_spirv(sh, &w);
+        if (sh && w >= big_cs_words() && w <= maxw) todo[n++] = sh;
+    }
+    free(all);
+    PC.todo = todo, PC.n = n, PC.next = 0, PC.done = 0, PC.failed = 0, PC.t0 = now_ms();
+    uint32_t loaded0 = (uint32_t)PB.loaded;
+    // Every core: the compile memory gate starts the big ones side by side only while the RAM allows.
+    int cpus = (int)plat_cpu_usable(), k = 0;
+    PlatThread *t[64];
+    for (int i = 0; i < cpus && i < 64 && (size_t)i < n; i++)
+        if ((t[k] = plat_thread_new(prep_cs_worker, NULL, "prep compute"))) k++;
+    if (!k) prep_cs_worker(NULL);
+    for (int i = 0; i < k; i++)
+        while (!plat_thread_join_ns(t[i], 2000000000u))
+            rt_log("vk_pipeline: prewarm: %d of %zu big compute shaders, %.0f ms", (int)PC.done, n, now_ms() - PC.t0);
+    rt_log("vk_pipeline: prewarm: %zu big compute shaders ready (%u from their binary, %d failed) in %.0f ms on %d threads", n,
+           (uint32_t)PB.loaded - loaded0, (int)PC.failed, now_ms() - PC.t0, k ? k : 1);
+    free(todo);
 }
 
 VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
@@ -4219,7 +4931,9 @@ VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
             // (graphics draws on the replay thread, the prebuild workers) for the whole compile, a visible hitch.
             plat_mutex_unlock(&P.lock);
             uint64_t p0 = perf_begin();
+            tl_holds_plock = 1;
             pipe = compute_create(cs, l);
+            tl_holds_plock = 0;
             perf_end(PERF_PIPE, p0);
             plat_mutex_lock(&P.lock);
             Pipe *other = pipe_find(&k, sizeof k, h);   // a prebuild worker finished the same pipeline meanwhile

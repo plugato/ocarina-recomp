@@ -17,7 +17,19 @@
 
 #include <vulkan/vulkan.h>
 
-#include "platform/msvc_compat.h"   // __declspec, _countof and wcscpy_s outside MSVC (clang 18 on Linux)
+#ifndef _WIN32   // Linux: what AMD's sources take from MSVC/MinGW (__declspec(dllexport), _countof, the array wcscpy_s)
+#include <wchar.h>
+#define FFX_GCC 1
+#ifndef _countof
+#define _countof(a) (sizeof(a) / sizeof(*(a)))
+#endif
+template <size_t N> static inline int wcscpy_s(wchar_t (&dst)[N], const wchar_t *src) {
+    wcsncpy(dst, src, N - 1);
+    dst[N - 1] = 0;
+    return 0;
+}
+#endif
+
 #include "third_party/fsr2/ffx_assert.cpp"
 #include "third_party/fsr2/ffx_fsr2.cpp"
 #include "third_party/fsr2/vk/ffx_fsr2_vk.cpp"
