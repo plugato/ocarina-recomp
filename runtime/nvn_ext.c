@@ -4,6 +4,7 @@
 // Copyright (c) 2026 jhaizhou; origin d2r-mobile); mach timing and Metal wording dropped. Its *Deferred binds and
 // memory-callback switches live with the command buffer in nvn_api_cmd.c.
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "gfx.h"
@@ -21,6 +22,13 @@ void nvn_pool_invalidate(const pool_t *p, uint64_t off, uint64_t size) {
         static long at = -2;
         if (at == -2) { const char *e = getenv("OOT_INV_LOG"); at = e ? atol(e) : -1; }
         long f = (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+        if (at >= 0 && f >= at && f < at + 3 && size == 0x40) {
+            const uint64_t *q = (const uint64_t *)(uintptr_t)((const uint8_t *)p->mem + off);
+            rt_log("inv40: frame %ld pool %p+%#llx: %#llx %#llx %#llx %#llx %#llx %#llx %#llx %#llx", f, (const void *)p->mem,
+                   (unsigned long long)off, (unsigned long long)q[0], (unsigned long long)q[1], (unsigned long long)q[2],
+                   (unsigned long long)q[3], (unsigned long long)q[4], (unsigned long long)q[5], (unsigned long long)q[6],
+                   (unsigned long long)q[7]);
+        }
         if (at >= 0 && f >= at && f < at + 40 && size == 0x1040) {
             const uint8_t *m = (const uint8_t *)(uintptr_t)p->mem + off;
             float w[8] = {0};
@@ -89,9 +97,57 @@ NVN_API(nvnMemoryPoolInvalidateMappedRange) {
     {
         const char *e = rt_live("OOT_INV_WAIT");
         int mode = e ? atoi(e) : 0;
-        if (mode == 1 || (mode == 2 && arg_x(c, 2) == 0x1040)) {
+        int pick = mode == 1 || (mode == 2 && arg_x(c, 2) == 0x1040);
+        if (mode == 3) {   // =3: only the sizes in OOT_INV_WAIT_SIZES (hex, comma separated; "big" = 64 KiB or more)
+            const char *l = rt_live("OOT_INV_WAIT_SIZES");
+            for (char *end; l && *l && !pick; l = *end ? end + 1 : end) {
+                if (!strncmp(l, "big", 3)) { pick = arg_x(c, 2) >= 0x10000; end = (char *)l + 3; continue; }
+                uint64_t v = strtoull(l, &end, 16);
+                if (end == l) break;
+                pick = v == arg_x(c, 2);
+            }
+        }
+        if (pick) {
             NVN_BLOCKING();
             gfx_backend()->finish();
+        }
+    }
+    {   // LOCAL TEST (Ocarina): OOT_INV_CALLER=1: the game code behind each 0x1040-byte invalidate, once per caller
+        static int on = -1, n;
+        static uint64_t seen[32];
+        if (on < 0) on = getenv("OOT_INV_CALLER") != NULL;
+        {   // OOT_INV_OBJ=<frame>: at that frame, the object (x19) of the 0x1040 readbacks as words, for 8 frames
+            static long at = -2;
+            if (at == -2) { const char *e = getenv("OOT_INV_OBJ"); at = e ? atol(e) : -1; }
+            long f = (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+            if (at >= 0 && f >= at && f < at + 8 && arg_x(c, 2) == 0x1040 && c->x[30] == 0x7000337c80ull) {
+                const uint32_t *o = (const uint32_t *)(uintptr_t)c->x[19];
+                char line[160];
+                for (int r = 0x300; r < 0x3a8; r += 32) {
+                    int k = 0;
+                    for (int j = 0; j < 8; j++) k += snprintf(line + k, sizeof line - (size_t)k, " %08x", o[(r >> 2) + j]);
+                    rt_log("obj f%ld +%03x:%s", f, r, line);
+                }
+                for (int ring = 0x320; ring <= 0x360; ring += 0x20) {
+                    const float *h = *(const float *const *)(uintptr_t)(c->x[19] + ring);
+                    uint32_t n = *(const uint32_t *)(uintptr_t)(c->x[19] + ring + 0x18);
+                    if (!h || n > 64) continue;
+                    int k = 0;
+                    for (uint32_t j = 0; j < n && k < 150; j++) k += snprintf(line + k, sizeof line - (size_t)k, " %.2g", h[j]);
+                    rt_log("obj f%ld ring +%x n=%u sum %g:%s", f, ring, n, *(const float *)(uintptr_t)(c->x[19] + ring + 8), line);
+                }
+            }
+        }
+        if (on && (arg_x(c, 2) == 0x1040 || arg_x(c, 2) == 0x40) && n < 32) {
+            int k = 0;
+            while (k < n && seen[k] != c->x[30]) k++;
+            if (k == n) {
+                seen[n++] = c->x[30];
+                const pool_t *pl = arg_p(c, 0);
+                rt_log("inv caller: lr %#llx pool %p+%#llx x19 %#llx x20 %#llx x21 %#llx", (unsigned long long)c->x[30],
+                       (const void *)pl->mem, (unsigned long long)off, (unsigned long long)c->x[19], (unsigned long long)c->x[20],
+                       (unsigned long long)c->x[21]);
+            }
         }
     }
     if (off >= 0) nvn_pool_invalidate(arg_p(c, 0), (uint64_t)off, arg_x(c, 2));

@@ -150,6 +150,31 @@ hash das páginas flushadas e não encontrou nenhuma mudança sem registro.
 - **60 fps num monitor de 100 Hz tremem**, porque os frames alternam entre 1 e 2 atualizações da tela. Use o monitor
   em 60 ou 120 Hz.
 
+## Problema aberto: olhar para o sol estoura a imagem
+
+Ao virar a câmera para o sol na Floresta Kokiri, o recomp enche a cena de névoa clara. O brilho médio fica em 150-170,
+contra 88 no Eglantine. A causa passa pelo tempo da GPU em relação à CPU:
+
+- A cada frame, a função `main 0x7000337060` dá invalidate em três buffers de 0x1040 bytes escritos por shaders. Na
+  floresta eles ficam em `0x25fb6b000`, `0x25fb6e000` (compute `435a0138b9013040`) e `0x25fb71000`. A função lê um float
+  de cada, escreve zeros e dá flush. Cada valor entra numa média móvel de 15 frames (anéis em `+0x320`, `+0x340` e
+  `+0x360` do objeto).
+- Com a GPU 3 submits atrás (`lag3`), em metade dos frames a CPU lê os próprios zeros, e as médias saem alternando
+  0 e o valor real.
+- No Eglantine as médias são estáveis: `6b` ≈0,79-0,92 e `6e` = 0. Com uma espera da CPU pela GPU no invalidate
+  (`OOT_INV_WAIT`), as do recomp ficam iguais às dele, e a vista contra o sol também (95 contra 88).
+- Mas qualquer sincronização da CPU com a GPU (espera no invalidate em qualquer ponto, `OOT_SUBMIT_SYNC=1` ou `lag2`)
+  estoura a vista de costas para o sol (115 contra 58). Há então um segundo mecanismo, ainda sem causa conhecida, que
+  depende de quanto a GPU fica atrás.
+- Medido sem efeito ou pior: occlusion queries falsas (`OOT_OQ_FAKE=1`); devolver ao jogo o último resultado concluído
+  da GPU em vez do zero (a tela ficou branca, revertido). O hack de EV −1,25 só escala o bloom e não serve para as duas
+  vistas.
+
+Diagnósticos usados: `OOT_INV_CALLER=1` (quem dá invalidate), `OOT_INV_OBJ=<frame>` (o objeto e as três médias),
+`OOT_INV_WAIT=3` com `OOT_INV_WAIT_SIZES` (bissecar a espera por tamanho, ao vivo), `OOT_TRACE_ADDR`/`OOT_TRACE_FRAME`.
+No Eglantine, o servidor de depuração (`read_memory`, `search_memory`) acha o mesmo objeto pelo padrão
+`000040c00ad7a33c9a99193e0000803f010000001e000000` (objeto = endereço − 0x304).
+
 ## Diagnósticos (`LOCAL TEST`)
 
 | Variável | Mostra |
