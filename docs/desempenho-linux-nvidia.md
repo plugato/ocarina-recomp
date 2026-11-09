@@ -16,7 +16,7 @@ Cenário de todas as medições: Floresta Kokiri, na varanda da casa do Link, sa
 | Todos os computes grandes compilados (vegetação e folhas se mexem) | 25 | 71 | `27bf943` |
 | Mirror sem re-upload, merge até 16 MiB, `lag3`, EV 0 | ~50 | 60 | `3f0eedd` |
 | Replay mais leve (15 → 13 ms por frame) | ~50 | 60 | `a89bbd3` |
-| Captura das escritas da CPU no submit (`OOT_CAPTURE`) | ~55-57 | 61 | este |
+| Captura das escritas da CPU no submit (`OOT_CAPTURE`) | ~55-57 | 61 | `5c11e98` |
 
 Com o monitor a 100 Hz, 50 fps é exatamente uma imagem a cada 2 atualizações da tela, um ritmo regular.
 
