@@ -923,6 +923,16 @@ static void maybe_split(VkExec *ex) {
 // An ordered read of the GPU-visible backing at this replay position. In particular, imported guest bytes can be
 // older than their shadow or VRAM mirror. Read through the same resolver/pick path as a buffer copy, never the VA.
 int vk_exec_read_buffer(VkExec *ex, uint64_t addr, uint64_t size, void *out) {
+    {   // LOCAL TEST (Ocarina): how often the replay waits for the GPU to read a buffer back
+        static uint64_t calls, last_frame;
+        uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+        calls++;
+        if (f >= last_frame + 600) {
+            if (last_frame) rt_log("vk: ordered buffer reads: %.1f per frame (last %#llx +%llu)", (double)calls / (double)(f - last_frame),
+                                   (unsigned long long)addr, (unsigned long long)size);
+            last_frame = f, calls = 0;
+        }
+    }
     if (!x_here || ex != &X || !ex->cb || !out || !addr || !size || size > (8ull << 20) ||
         addr > UINT64_MAX - size || (addr & 3) || (size & 3)) return 0;
     VkMemSpan source;

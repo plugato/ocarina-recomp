@@ -116,9 +116,37 @@ static void counter_cb(void *arg) {
 
 // Reports queued by the replay that the GPU has not finished. The condition of RENDER_COND reads a timestamp one as 0
 // and a samples-passed one as unknown.
-#define PENDING 32768   // Ocarina makes hundreds of samples-passed reports a frame: at 256 a timestamp report fell out, its condition read stale memory and a clear ran (seedds/nxnative "Report tables that dropped entries")
-static struct { uint64_t addr, fence; int unknown; } pending[PENDING];
-static unsigned pending_head;
+// Ocarina makes hundreds of samples-passed reports a frame: a ring of 256 dropped a timestamp report, its condition read
+// stale memory and a clear ran (seedds/nxnative "Report tables that dropped entries"); then a ring of 32768.
+// LOCAL TEST (Ocarina): the newest report per address, open addressing. counter_word scanned the ring newest first until a
+// done report, and with the GPU three submissions behind (OOT_SUBMIT_SYNC=lag3) hundreds of reports are in flight: the
+// scan, twice per conditional draw, was 8.6% of the replay thread. The newest report to an address decides, and fences
+// only grow, so its entry alone answers. A full probe run evicts its oldest entry (the ring dropped the oldest too).
+#define PEND_HASH (1u << 16)
+#define PEND_PROBE 8
+static struct { uint64_t addr, fence; int unknown; } pend_h[PEND_HASH];
+
+static unsigned pend_slot(uint64_t addr) { return (unsigned)((addr >> 3) * 0x9E3779B97F4A7C15ull >> 48) & (PEND_HASH - 1); }
+
+static void pend_put(uint64_t addr, uint64_t fence, int unknown) {
+    unsigned h = pend_slot(addr), victim = h;
+    for (unsigned k = 0; k < PEND_PROBE; k++) {
+        unsigned i = (h + k) & (PEND_HASH - 1);
+        if (pend_h[i].addr == addr || !pend_h[i].addr) { victim = i; break; }
+        if (pend_h[i].fence < pend_h[victim].fence) victim = i;
+    }
+    pend_h[victim].addr = addr, pend_h[victim].fence = fence, pend_h[victim].unknown = unknown;
+}
+
+static int pend_get(uint64_t addr, uint64_t done, int *unknown) {   // 1: the newest report to addr is not done
+    unsigned h = pend_slot(addr);
+    for (unsigned k = 0; k < PEND_PROBE; k++) {
+        unsigned i = (h + k) & (PEND_HASH - 1);
+        if (!pend_h[i].addr) return 0;
+        if (pend_h[i].addr == addr) return pend_h[i].fence > done ? (*unknown = pend_h[i].unknown, 1) : 0;
+    }
+    return 0;
+}
 
 // ---- occlusion counts (samples passed)
 //
@@ -327,7 +355,7 @@ static void report_counter(VkExec *ex, const p_report_counter *p) {
         *a = (CounterWrite){p->addr, ex->submitted_ticks};
         vk_completion_add(ex->fence, counter_cb, a);
     }
-    pending[pending_head++ % PENDING] = (typeof(pending[0])){p->addr, ex->fence, samples};
+    pend_put(p->addr, ex->fence, samples);
 }
 
 // ---- conditional rendering
@@ -335,11 +363,8 @@ static void report_counter(VkExec *ex, const p_report_counter *p) {
 // 1: *v read, 0: not readable, 2: a samples-passed report not done yet (unknown)
 static int counter_word(uint64_t addr, uint64_t *v) {
     uint64_t done = vk_sync_fence_done();
-    for (unsigned k = 1; k <= PENDING; k++) {   // newest first: the last report to addr decides
-        unsigned i = (pending_head - k) % PENDING;
-        if (pending[i].fence <= done) break;   // newest first, fences only grow: nothing older is pending
-        if (pending[i].addr == addr) return *v = 0, pending[i].unknown ? 2 : 1;
-    }
+    int unknown;
+    if (pend_get(addr, done, &unknown)) return *v = 0, unknown ? 2 : 1;   // the newest report to addr is in flight
     VkMemSpan m;
     if (nvn_gpu_only(addr) || !vk_mem_resolve(addr, sizeof *v, &m)) return 0;
     memcpy(v, (const void *)(uintptr_t)addr, sizeof *v);

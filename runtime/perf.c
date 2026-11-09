@@ -366,7 +366,18 @@ const char *rt_live(const char *name) {
     static const char *path;
     static int init;
     if (!init) path = getenv("OOT_LIVE"), init = 1;
-    if (!path || !*path) return getenv(name);
+    if (!path || !*path) {   // no live file: each name's getenv once (merge_max asks on every storage write)
+        static struct { const char *name, *value; } once[LIVE_N];
+        static volatile int nonce;
+        int n = __atomic_load_n(&nonce, __ATOMIC_ACQUIRE);
+        for (int k = 0; k < n; k++)
+            if (once[k].name == name || !strcmp(once[k].name, name)) return once[k].value;
+        const char *v = getenv(name);
+        plat_mutex_lock(&live_lock);
+        if (nonce < LIVE_N) once[nonce].name = name, once[nonce].value = v, __atomic_store_n(&nonce, nonce + 1, __ATOMIC_RELEASE);
+        plat_mutex_unlock(&live_lock);
+        return v;
+    }
     uint64_t now = plat_now_ms();
     plat_mutex_lock(&live_lock);
     if (now - live_at >= 250) live_at = now, live_reload(path);

@@ -224,8 +224,16 @@ extern "C" int nvn2_lower(const uint8_t *control, const uint8_t *code, const uin
 
 // The dump name (gfx_shader_nvn2_hash) of the NVN 2 stage a lowered code buffer came from, or 0. Lowered buffers live
 // for the process, so their addresses never name another stage.
+// LOCAL TEST (Ocarina): a per-thread direct-mapped cache in front of the locked map: the replay asks several times per
+// draw (3.2% of the replay thread). A buffer's answer never changes once it is in origins; a miss (0) is not cached,
+// since the buffer may be lowered later.
 extern "C" uint64_t nvn2_origin(const uint8_t *code) {
+    static thread_local struct { const uint8_t *code; uint64_t origin; } memo[512];
+    auto &m = memo[(reinterpret_cast<uintptr_t>(code) >> 4) * 0x9E3779B97F4A7C15ull >> 55];
+    if (code && m.code == code) return m.origin;
     std::lock_guard<std::mutex> g(lock);
     auto it = origins.find(code);
-    return it == origins.end() ? 0 : it->second;
+    if (it == origins.end()) return 0;
+    m.code = code, m.origin = it->second;
+    return it->second;
 }

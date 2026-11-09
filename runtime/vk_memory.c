@@ -1570,6 +1570,8 @@ typedef struct {
     uint64_t snap_bytes, merge_bytes, merge_dispatches, snap_allocs;   // write-back merge
     uint64_t page_bytes, flush_n, flush_bytes, flush_calls, flush_sum;   // what mirror_sync queues, by source
     uint64_t wb_kept;                  // written pages mirror_sync left alone: their newest stamp is a write-back from the mirror
+    uint64_t flush_trusted;            // flushed bytes left to the write watch (flush_trust)
+    uint64_t flush_gpu;                // flushed bytes whose newest stamp is a mirror write-back (TOTK_TRACE=perf)
 } MirrorAcc;
 static MirrorAcc mrep;                 // replay: this submission
 static MirrorAcc macc;                 // mirror_stat_lock: since the last summary
@@ -1830,6 +1832,15 @@ static void mirror_retire(void *arg) {
 }
 
 // Replay thread, the first access of this submission: queues the copies of the pages written since the last sync.
+// LOCAL TEST (Ocarina): a flushed range (nvnMemoryPoolFlushMappedRange) went up whole, 46.8 MiB a frame in Kokiri Forest
+// against 1.3 MiB of pages the write watch saw written. In regions the write watch tracks (snapped this epoch, not
+// untracked) every CPU write is already stamped and uploaded by the page loop, so the flush adds nothing there.
+// TOTK_FLUSH_TRUST=0 uploads flushed ranges whole again (live with OOT_LIVE).
+static int flush_trust(void) {   // off by default: with it the forest's exposure wanders (luma 66-91 against 60)
+    const char *e = rt_live("TOTK_FLUSH_TRUST");
+    return e && *e == '1';
+}
+
 static void mirror_sync(PoolRec *r) {
     uint64_t t0 = qpc();
     r->acc_sub = msub;
@@ -1893,11 +1904,50 @@ static void mirror_sync(PoolRec *r) {
         r->fl_n = 0, r->fl_calls = r->fl_sum = 0;
         plat_mutex_unlock(&flush_lock);
         mrep.flush_calls += calls, mrep.flush_sum += sum;
+        int trust = flush_trust();
         for (int i = 0; i < n; i++) {
             uint64_t a = fl[i].lo > lo ? fl[i].lo : lo, b = fl[i].hi < hi ? fl[i].hi : hi;
             if (a >= b) continue;
+            if (trust) {   // only the parts the write watch does not see; its written pages went up above
+                for (uint64_t x = a; x < b;) {
+                    uint64_t k = x >> SNAP_SHIFT, e = (k + 1) << SNAP_SHIFT;
+                    if (e > b) e = b;
+                    if (snap_untracked[k] || snap_at[k] != mepoch) {
+                        range_add(&pend, &npend, &cpend, r, x - lo, e - x);
+                        mrep.flush_n++, mrep.flush_bytes += e - x;
+                    } else {
+                        // Pages written since this epoch's query still have their bit: a flush made after the query
+                        // goes up now, as the whole range did, not one submission later (that moved the picture).
+                        // The peek leaves the bit for the next query; the stamped pages went up above.
+                        static uint64_t wp[512];
+                        uint64_t got = 0, y = x;
+                        for (;;) {
+                            uint64_t c = mem_written_peek(y, e - y, wp, 512);
+                            if (c == UINT64_MAX) { range_add(&pend, &npend, &cpend, r, y - lo, e - y), got += e - y; break; }
+                            for (uint64_t j = 0; j < c; j++)
+                                if (wp[j] >= y && wp[j] < e) range_add(&pend, &npend, &cpend, r, wp[j] - lo, 4096), got += 4096;
+                            if (c < 512) break;
+                            y = wp[c - 1] + 4096;
+                            if (y >= e) break;
+                        }
+                        mrep.flush_n += got != 0, mrep.flush_bytes += got;
+                        mrep.flush_trusted += e - x - got;
+                    }
+                    x = e;
+                }
+                continue;
+            }
             range_add(&pend, &npend, &cpend, r, a - lo, b - a);
             mrep.flush_n++, mrep.flush_bytes += b - a;
+            if (rt_trace & RT_TRACE_PERF) {   // flushed pages whose newest stamp is the GPU's (a mirror write-back)
+                plat_mutex_lock_shared(&gen_lock);
+                for (uint64_t x = a; x < b; x += 4096) {
+                    const uint32_t *ch = gen_chunk[x >> GEN_CHUNK_SHIFT], *mw = mw_chunk[x >> GEN_CHUNK_SHIFT];
+                    uint32_t pi = (x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1);
+                    if (ch && mw && ch[pi] && mw[pi] == ch[pi]) mrep.flush_gpu += 4096;
+                }
+                plat_mutex_unlock_shared(&gen_lock);
+            }
             if ((rt_trace & RT_TRACE_PERF) && b - a >= 16u << 20)
                 rt_log("mem: mirror frame %llu: flush range %.1f MiB at +%.1f MiB of a %.1f MiB pool (%d ranges from %llu "
                        "flushes of %.3f MiB)", (unsigned long long)mirror_frame, (b - a) / 1048576.0, (a - lo) / 1048576.0,
@@ -2272,8 +2322,55 @@ uint64_t vk_mem_mirror_uploaded(void) {
     return n;
 }
 
+// LOCAL TEST (Ocarina): OOT_FLUSH_AUDIT=<frame>: from that frame on, for 300 frames, each flushed page is hashed; a page
+// whose bytes changed since its previous flush while the write watch saw no write (no newer stamp, no pending bit) is a
+// write the watch missed. One line every 60 frames.
+static void flush_audit(uint64_t a, uint64_t b) {
+    static long at = -2;
+    if (at == -2) { const char *e = getenv("OOT_FLUSH_AUDIT"); at = e ? atol(e) : -1; }
+    long f = (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    if (at < 0 || f < at || f > at + 300) return;
+    enum { N = 1 << 18 };
+    static struct { uint64_t page, hash; uint32_t gen; } *t;
+    static uint64_t pages, changed, missed, peeked, last_log;
+    static uint64_t sample[4];
+    static PlatMutex m = PLAT_MUTEX_INIT;
+    plat_mutex_lock(&m);
+    if (!t && !(t = calloc(N, sizeof *t))) { plat_mutex_unlock(&m); return; }
+    uint64_t wp[1024];
+    uint64_t nw = mem_written_peek(a, b - a, wp, 1024);
+    for (uint64_t x = a; x < b; x += 4096) {
+        uint64_t h = 1469598103934665603ull;
+        const uint64_t *w = (const uint64_t *)(uintptr_t)x;
+        for (int i = 0; i < 512; i++) h = (h ^ w[i]) * 1099511628211ull;
+        plat_mutex_lock_shared(&gen_lock);
+        const uint32_t *ch = gen_chunk[x >> GEN_CHUNK_SHIFT];
+        uint32_t g = ch ? ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)] : 0;
+        plat_mutex_unlock_shared(&gen_lock);
+        int pend = 0;
+        for (uint64_t k = 0; nw != UINT64_MAX && k < nw && k < 1024; k++) pend |= wp[k] == x;
+        unsigned i = (unsigned)((x >> 12) * 0x9E3779B97F4A7C15ull >> 46) & (N - 1);
+        pages++;
+        if (t[i].page == x && t[i].hash != h) {
+            changed++;
+            if (g == t[i].gen && !pend) { if (missed < 4) sample[missed] = x; missed++; }
+            if (pend) peeked++;
+        }
+        t[i].page = x, t[i].hash = h, t[i].gen = g;
+    }
+    if (f >= (long)last_log + 60) {
+        last_log = (uint64_t)f;
+        rt_log("flush audit frame %ld: %llu pages flushed, %llu changed since their last flush, %llu of them unseen by the write "
+               "watch (%llu with the bit pending); e.g. %#llx %#llx", f, (unsigned long long)pages, (unsigned long long)changed,
+               (unsigned long long)missed, (unsigned long long)peeked, (unsigned long long)sample[0], (unsigned long long)sample[1]);
+        pages = changed = missed = peeked = 0;
+    }
+    plat_mutex_unlock(&m);
+}
+
 void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size) {
     if (!vk_mirror_on || !size || !p->mem) return;
+    flush_audit(((uintptr_t)p->mem + off) & ~0xfffull, ((uintptr_t)p->mem + off + size + 0xfff) & ~0xfffull);
     plat_inc64(&m_flush_calls);
     plat_add64(&m_flush_bytes, (int64_t)size);
     plat_mutex_lock_shared(&pool_lock);
@@ -2646,9 +2743,10 @@ static void mirror_log(uint64_t frame) {
            a.presnap_queries / f, a.presnap_bytes / f / M, a.sync_queries / f, a.prologues / f, qpc_ms(a.presnap_t + a.sync_t) / f,
            qpc_ms(a.presnap_t) / f, qpc_ms(a.sync_t) / f, ver);
     rt_log("mem: mirror frame %llu: upload sources per frame, overlaps counted twice: written pages %.3f MiB; flush ranges "
-           "%.2f, %.3f MiB, from %.1f flushes of %.3f MiB; written back from the mirror, not uploaded again %.3f MiB",
+           "%.2f, %.3f MiB, from %.1f flushes of %.3f MiB; written back from the mirror, not uploaded again %.3f MiB; "
+           "flushed, left to the write watch %.3f MiB; flushed pages the GPU wrote last %.3f MiB",
            (unsigned long long)frame, a.page_bytes / f / M, a.flush_n / f, a.flush_bytes / f / M, a.flush_calls / f,
-           a.flush_sum / f / M, a.wb_kept / f / M);
+           a.flush_sum / f / M, a.wb_kept / f / M, a.flush_trusted / f / M, a.flush_gpu / f / M);
 }
 
 // With TOTK_TRACE=perf every 600 frames: what holds device-local memory, to see what grows over a long session.
