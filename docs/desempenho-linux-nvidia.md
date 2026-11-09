@@ -150,7 +150,28 @@ hash das páginas flushadas e não encontrou nenhuma mudança sem registro.
 - **60 fps num monitor de 100 Hz tremem**, porque os frames alternam entre 1 e 2 atualizações da tela. Use o monitor
   em 60 ou 120 Hz.
 
-## Problema aberto: olhar para o sol estoura a imagem
+## Olhar para o sol estourava a imagem (corrigido)
+
+Correção: `OOT_READBACK_KEEP` (padrão `435a0138b9013040`, ao vivo; `0` desliga), em `vk_exec_draw.c`. O buffer que
+esse compute escreve guarda uma cópia do último resultado concluído da GPU. Se, no invalidate, as quatro somas ainda
+forem os zeros que a CPU escreveu, a cópia volta antes da leitura. Assim o jogo lê a soma completa mais recente (no
+máximo um frame atrasada), como no console e no Eglantine, e nada espera.
+
+| vista | antes | depois | Eglantine |
+|---|---|---|---|
+| contra o sol (slot de 2026-11-09) | 150-170 | 94-106 | 88 |
+| varanda | 60 | 60-63 | 58 |
+
+Detalhes do valor lido: o jogo guarda `1 − clamp((v/256 − 0,02)/0,13)`, ou seja, ler zero dá 1 e ler a soma cheia dá
+0. O Eglantine fica em 0 nas duas vistas. Duas armadilhas encontradas no caminho:
+- o merge do write-back só copia as palavras diferentes do snapshot, então uma soma igual à do frame anterior (cena
+  parada) deixava os zeros da CPU na memória;
+- o jogo zera só as quatro somas: os campos seguintes do buffer continuam preenchidos.
+
+A média do segundo buffer (`0x25fb6b000`) ainda cresce entre frames na varanda, porque o zero da CPU se perde. Isso já
+acontecia antes da correção e não aparece na imagem.
+
+### Histórico da investigação
 
 Ao virar a câmera para o sol na Floresta Kokiri, o recomp enche a cena de névoa clara. O brilho médio fica em 150-170,
 contra 88 no Eglantine. A causa passa pelo tempo da GPU em relação à CPU:

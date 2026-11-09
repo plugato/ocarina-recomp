@@ -205,12 +205,16 @@ static const RsList *rs_last_l;
 static uint32_t c0_dim[3], c0_binst;     // the dispatch size and base instance of the draw or dispatch being bound
 static uint64_t bind_gen = 1;            // bumped by every bind op that writes ex->prog, ubo, ssbo, tex or img
 
+static volatile int nzr;                                  // LOCAL TEST (Ocarina): readbacks kept (zr_note)
+static void zr_done(uint64_t addr, uint64_t size);
 static void cb_done(void *arg) {   // completion thread
     CbRes *r = arg;
     VkCtx *c = vk_ctx();
-    for (int i = 0; i < r->nwritten; i++)
+    for (int i = 0; i < r->nwritten; i++) {
         if (r->written[i].mirrored) vk_gpu_written_mirrored(r->written[i].addr, r->written[i].size);
         else vk_gpu_written(r->written[i].addr, r->written[i].size);
+        if (__atomic_load_n(&nzr, __ATOMIC_ACQUIRE)) zr_done(r->written[i].addr, r->written[i].size);
+    }
     for (int i = 0; i < r->npools; i++) {
         vkResetDescriptorPool(c->device, r->pools[i], 0);
         plat_mutex_lock(&spare_lock);
@@ -285,6 +289,92 @@ static uint8_t *scratch(VkExec *ex, uint64_t size, VkBuffer *buf, VkDeviceSize *
     uint8_t *p = c->map + c->used;
     c->used += size;
     return p;
+}
+
+// LOCAL TEST (Ocarina): readbacks that never read the CPU's own zeros. Each frame main 0x7000337060 invalidates three
+// 0x1040-byte buffers compute shaders write (592079442d7129da, 435a0138b9013040: the scene sum, aba5e6af8d4683eb), reads
+// one float of each, keeps 1 - clamp((v / 256 - 0.02) / 0.13) in a 15-frame average, writes zeros and flushes. On the
+// console and in Eglantine the read finds the GPU's whole sum of the frame before (average 0 for the scene sum, in every
+// view). With the GPU three submissions behind, the read found the CPU's zeros in some frames (average up to 0.5: facing
+// the sun the picture washed out, luma 165 against Eglantine's 88); with CPU and GPU in step the zeros landed in the
+// middle of the GPU's sum instead (the forest washed out, 115 against 58). So a range these shaders write keeps a copy
+// of the GPU's last completed result, and an invalidate that finds the sums still zero puts that copy back first: the
+// game reads the latest whole sum, one frame old at most, and nothing waits. Slot of 2026-11-09 facing the sun: luma
+// 94-106 (Eglantine 88, before 150-170); the porch view stays at 60-63 (Eglantine 58). Only the scene sum by default:
+// the other two change nothing seen. OOT_READBACK_KEEP=<hex origins,...> (live; 0: none).
+#define ZR_N 16
+static struct { uint64_t addr, size; uint8_t *copy; int valid, fresh; } zr[ZR_N];
+static volatile int nzr;
+static PlatMutex zr_lock = PLAT_MUTEX_INIT;
+
+static const char *zr_list(void) {
+    const char *e = rt_live("OOT_READBACK_KEEP");
+    return e ? e : "435a0138b9013040";
+}
+
+static int zr_listed(uint64_t origin) {
+    const char *e = zr_list();
+    for (char *end; e && *e; e = *end ? end + 1 : end) {
+        uint64_t v = strtoull(e, &end, 16);
+        if (end == e) break;
+        if (v && v == origin) return 1;
+    }
+    return 0;
+}
+
+static void zr_note(uint64_t addr, uint64_t size) {   // replay: a listed compute writes [addr, addr+size)
+    int n = __atomic_load_n(&nzr, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++)
+        if (zr[i].addr == addr && zr[i].size == size) return;
+    uint8_t *copy = malloc(size);
+    if (!copy) return;
+    plat_mutex_lock(&zr_lock);
+    if (nzr < ZR_N) {
+        zr[nzr].addr = addr, zr[nzr].size = size, zr[nzr].copy = copy, copy = NULL;
+        __atomic_store_n(&nzr, nzr + 1, __ATOMIC_RELEASE);
+        rt_log("vk: readback %#llx+%#llx keeps the GPU's last result (OOT_READBACK_KEEP)", (unsigned long long)addr,
+               (unsigned long long)size);
+    }
+    plat_mutex_unlock(&zr_lock);
+    free(copy);
+}
+
+// The game zeroes and reads the first 16 bytes (four float sums); the words after them stay set.
+static int zr_zeroed(uint64_t a) {
+    const uint64_t *w = (const uint64_t *)(uintptr_t)a;
+    return !w[0] && !w[1];
+}
+
+static void zr_done(uint64_t addr, uint64_t size) {   // completion thread: the write-back is in guest memory
+    int n = __atomic_load_n(&nzr, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++)
+        if (zr[i].addr >= addr && zr[i].addr + zr[i].size <= addr + size) {
+            // Sums zero: the merge wrote nothing back (it writes the words that differ from the snapshot, and a sum
+            // equal to the frame before's, a still view, differs in none), so guest memory still holds the CPU's zeros.
+            // No new result then: the copy stays.
+            if (zr_zeroed(zr[i].addr)) continue;
+            plat_mutex_lock(&zr_lock);
+            memcpy(zr[i].copy, (const void *)(uintptr_t)zr[i].addr, zr[i].size);
+            zr[i].valid = 1, zr[i].fresh = 1;
+            plat_mutex_unlock(&zr_lock);
+        }
+}
+
+void nvn_readback_zero(uint64_t addr, uint64_t size) {   // game thread, before the pool invalidate
+    int n = __atomic_load_n(&nzr, __ATOMIC_ACQUIRE);
+    if (!n || !strcmp(zr_list(), "0")) return;
+    plat_mutex_lock(&zr_lock);
+    for (int i = 0; i < n; i++) {
+        if (!zr[i].valid || zr[i].addr < addr || zr[i].addr + zr[i].size > addr + size) continue;
+        // The sums still the CPU's zeros: no newer result reached guest memory (a flag set at the completion was not
+        // enough: the zeros came back after it). The last result again.
+        if (zr_zeroed(zr[i].addr)) {
+            rt_trace_addr("readback kept", zr[i].addr, zr[i].addr + zr[i].size, 0);
+            memcpy((void *)(uintptr_t)zr[i].addr, zr[i].copy, zr[i].size);
+        }
+        zr[i].fresh = 0;
+    }
+    plat_mutex_unlock(&zr_lock);
 }
 
 static void note_written_m(VkExec *ex, uint64_t addr, uint64_t size, int mirrored) {
@@ -1620,6 +1710,9 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
                 note_written_m(ex, b->addr - lead, guarded && bi.range > WRITTEN_CAP ? WRITTEN_CAP : bi.range, bind_mirrored);
                 const uint8_t *ctl, *code;
                 uint32_t len;
+                if (st == NVN_STAGE_CS && b->size && b->size <= 0x10000 && ex->prog && find_stage(ex->prog, st, &ctl, &code, &len) &&
+                    zr_listed(nvn2_origin(code)))
+                    zr_note(b->addr, b->size);
                 if (vk_sync_noting() && ex->prog && find_stage(ex->prog, st, &ctl, &code, &len))
                     vk_sync_note_write(b->addr - lead, bi.range, nvn2_origin(code));
             }

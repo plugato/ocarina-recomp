@@ -123,3 +123,4 @@ void nvn_pool_invalidate(const pool_t *p, uint64_t off, uint64_t size);
 // MemoryPoolFlushMappedRange: the CPU wrote [mem + off, mem + off + size). Weak no-op in nvn_ext.c; a back end that keeps
 // device-side copies of pool memory (vk_memory.c's VRAM mirror) defines it and copies the range again.
 void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size);
+void nvn_readback_zero(uint64_t addr, uint64_t size);   // LOCAL TEST (Ocarina): vk_exec_draw.c, before a pool invalidate: a kept readback whose sums are still the CPU's zeros gets the GPU's last result back

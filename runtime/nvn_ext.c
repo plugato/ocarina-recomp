@@ -38,10 +38,12 @@ void nvn_pool_invalidate(const pool_t *p, uint64_t off, uint64_t size) {
         }
     }
     rt_trace_addr("cpu invalidate (before)", (uintptr_t)p->mem + off, (uintptr_t)p->mem + off + size, size);
+    nvn_readback_zero((uintptr_t)p->mem + off, size);
     gfx_backend()->guest_read((uintptr_t)p->mem + off, size);
 }
 
 __attribute__((weak)) void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size) { (void)p, (void)off, (void)size; }
+__attribute__((weak)) void nvn_readback_zero(uint64_t addr, uint64_t size) { (void)addr, (void)size; }
 
 // ---------- debug labels, markers, groups, checkpoints: meaningful only to NVN debugging tools
 // void nvn<Object>SetDebugLabel(NVN<object> *o, const char *label)
