@@ -130,7 +130,16 @@ hash das páginas flushadas e não encontrou nenhuma mudança sem registro.
   - partes menores de command buffer (`TOTK_SPLIT_US`, `TOTK_SPLIT_DRAWS`);
   - lag maior (`lag4`, `lag5`);
   - compilar os computes grandes com otimização (o driver já otimiza, os tempos de GPU não mudaram);
-  - baixar a prioridade da thread do driver.
+  - baixar a prioridade da thread do driver;
+  - prefetch das tabelas de memo de textura (`FM` e `TD`, 448 e 576 KiB, maiores que o L2 de 512 KiB do Ryzen 5600):
+    `feedback_scan` caiu de 7,2% para 6,8%, sem fps a mais;
+  - reaproveitar os descriptors do estágio de fragment entre draws do mesmo pipeline. 64,5% dos draws repetem
+    programa e estado do anterior (`TOTK_BIND_STATS=1`), mas só 6% repetem também os bindings de fragment, e os UBOs
+    copiados para memória transitória mudam de endereço a cada draw.
+
+  Perfil do replay (com frame pointers, `-fno-omit-frame-pointer` em `rtflags`): `prepare_draw` 60%, `bind_resources`
+  27% (11% de tempo próprio), `feedback_scan` 7%, `shader_for` 5%, cópias de memória 6,5%. São ~2.000 draws por frame,
+  ~4 µs cada. Ganhar os ~2 ms que faltam pede uma mudança estrutural, como gravar partes do frame em mais de uma thread.
 - **`lag6` ou mais ainda pisca**, mesmo com a captura. Sobra o snapshot de uniforms, que é tirado quando o replay grava,
   e não no submit.
 - **Uma thread do driver NVIDIA** (aparece com o nome `guest main`, dentro de `_nv002nvvm`) fica a 100% de um núcleo
