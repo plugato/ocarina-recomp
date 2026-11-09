@@ -113,6 +113,8 @@ Se o hash continuar diferente, este jogo não é a versão 1.1.1, e o resto não
 
 **Com um `.nup`**, a extração e a imagem ocupam cerca de 26 GB cada, mas o `--consume` apaga cada arquivo extraído ao colocá-lo na imagem. Use-o só na cópia extraída em `build\dump`:
 
+Se o `--list` mostrou mais de um pacote, troque `--package 0` por `--overlay-update` aqui também. Só com o pacote base o jogo ainda roda, mas com os shaders da 1.0 sob o código 1.1.1: imagem laranja e roxa e sem vegetação. O log avisa com `RomFS: WARNING: this RomFS is the base game's`.
+
 ```powershell
 .venv\Scripts\python.exe tools\extract_nup.py "C:\caminho\seu-jogo.nup" --out build\dump --only romfs --package 0
 .venv\Scripts\python.exe tools\pack_romfs.py --dir build\dump\romfs --out build\romfs --consume

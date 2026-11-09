@@ -430,6 +430,14 @@ static void overlay_init(void) {
         if (dirs[i] && *dirs[i] && strcmp(dirs[i], "0")) overlay_load(dirs[i], 0);
     heapdef_overlay();
     added_init();
+    // The executable is 1.1.1, whose code builds its per-frame constants for 1.1.1's shaders. A RomFS packed from the
+    // base package of a two-package .nup (extract_nup.py without --overlay-update) still runs, with the base game's
+    // shaders: the vegetation culling then reads its tables at the wrong offsets and culls everything, the canopy casts
+    // no shadow and the scene comes out orange and purple. The update adds this file; the base lacks it.
+    if (file_index("AI/FileEntry/FileEntry.Product.111.byml.zs") == UINT64_MAX)
+        rt_log("RomFS: WARNING: this RomFS is the base game's (1.0), not update 1.1.1: shaders do not match the 1.1.1 "
+               "code (orange picture, no vegetation). Repack it with tools/extract_nup.py --overlay-update, or lay "
+               "the update over it with TOTK_ROMFS_MODS");
     if (noverlay) qsort(overlays, noverlay, sizeof *overlays, overlay_order);
     for (size_t k = 1; k < noverlay; k++)
         if (overlays[k].index == overlays[k - 1].index)
