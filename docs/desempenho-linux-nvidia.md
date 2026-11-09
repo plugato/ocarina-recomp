@@ -150,6 +150,26 @@ hash das páginas flushadas e não encontrou nenhuma mudança sem registro.
 - **60 fps num monitor de 100 Hz tremem**, porque os frames alternam entre 1 e 2 atualizações da tela. Use o monitor
   em 60 ou 120 Hz.
 
+## Grama em varetas e sombras erradas depois do merge v0.3.2 (corrigido)
+
+O merge do projeto original (v0.3.0 → v0.3.2) trouxe o "first workgroup" das draws indiretas de mesh: o runtime copia a
+palavra +12 do registro para o support buffer (`mesh_args`), e o patch 0041 do tradutor soma esse valor ao índice do
+workgroup de task. Na Floresta Kokiri a grama perto da câmera virou varetas finas escuras e manchas escuras, e faltavam
+as manchas de sol no chão.
+
+Nos registros deste jogo, a palavra +12 não é um primeiro workgroup. É a quantidade de itens que o programa de task
+confere, e a contagem de workgroups é ela dividida por 32 ou 16, arredondada para cima (4026 → 126, 650 → 41,
+183 → 12; `OOT_DRAW_ARGS=<frame>` mostra os registros). Somada ao índice, a task lia depois do fim da lista que o culling
+escreveu.
+
+Correção: `OOT_MESH_FIRST=0` é o padrão (`main.c`, `game_defaults`); `OOT_MESH_FIRST=1` volta o comportamento do
+projeto original. Com o tradutor anterior ao merge (que não soma nada) ou com `OOT_MESH_FIRST=0`, a grama, as manchas
+de sol e a sombra do Link batem com o Eglantine no save de 2026-11-09 15h e na varanda.
+
+Também testado nessa cena, sem efeito na grama: `render_scale` 50 ou do jogo, modo portátil ou na base, e o compute
+gigante `dec1feb3c7fa967a` ligado. Ele compila em 31 min (`--warm-big-cs` com `DKB_SKIP_CS=3f6f2b1d671badcd`), não
+estoura mais a imagem e não muda a cena, então continua pulado por padrão.
+
 ## Olhar para o sol estourava a imagem (corrigido)
 
 Correção: `OOT_READBACK_KEEP` (padrão `435a0138b9013040`, ao vivo; `0` desliga), em `vk_exec_draw.c`. O buffer que

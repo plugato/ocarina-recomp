@@ -521,6 +521,11 @@ static void game_defaults(void) {
         // vk_memory.c "submit-time capture": the CPU's writes reach the mirrors as of each submit call, so the flushed
         // ranges (46.8 MiB a frame in the forest) no longer go up whole: ~50 -> ~56 fps, same picture.
         {"OOT_CAPTURE", "1"},
+        // vk_exec_draw.c mesh_first_on: the record's word at +12 is not a first workgroup here. It is the item count the
+        // task program checks (the group count is that over 32 or 16, rounded up: 4026 -> 126, 650 -> 41), so adding
+        // it to the workgroup index (translator patch 0041) read past the culled list: Kokiri's grass drew as thin dark
+        // sticks and dark patches. Off, the grass, sunlit patches and shadows match Eglantine. OOT_MESH_FIRST=1 brings it back.
+        {"OOT_MESH_FIRST", "0"},
     };
     for (size_t i = 0; i < sizeof d / sizeof *d; i++) {
         if (getenv(d[i][0])) continue;
