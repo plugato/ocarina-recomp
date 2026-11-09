@@ -106,9 +106,17 @@ int fs_save_busy(void) {
 }
 
 // ---- host directories
+// A symbolic link to a directory counts as one: a profile kept elsewhere (perfil -> ~/ocarina-data/perfil) made the
+// Linux launcher stop at "cannot create directory". "<p>/." follows the link.
 static int make_dir(const char *p) {
     int e = plat_fs_mkdir(p);
-    return !e || (e == PLAT_FS_EXISTS && plat_fs_kind(p) == PLAT_FS_DIR);
+    if (!e) return 1;
+    if (e != PLAT_FS_EXISTS) return 0;
+    int k = plat_fs_kind(p);
+    if (k == PLAT_FS_DIR) return 1;
+    if (k != PLAT_FS_LINK) return 0;
+    char dot[1104];
+    return snprintf(dot, sizeof dot, "%s/.", p) < (int)sizeof dot && plat_fs_kind(dot) == PLAT_FS_DIR;
 }
 
 // p and every missing parent.
