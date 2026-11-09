@@ -1836,7 +1836,13 @@ static void mirror_retire(void *arg) {
 // against 1.3 MiB of pages the write watch saw written. In regions the write watch tracks (snapped this epoch, not
 // untracked) every CPU write is already stamped and uploaded by the page loop, so the flush adds nothing there.
 // TOTK_FLUSH_TRUST=0 uploads flushed ranges whole again (live with OOT_LIVE).
-static int flush_trust(void) {   // off by default: with it the forest's exposure wanders (luma 66-91 against 60)
+// Off by default: with it the forest's exposure wanders (luma 62-94 against 60), with the stamping at the flush too.
+// Ocarina's scene sum (compute 435a0138b9013040 adds into a 0x1040-byte buffer at 0x25fb6e000 in Kokiri Forest; the
+// CPU reads it after a pool invalidate, writes zeros and flushes, every frame) then reads 29, 44, 74 or 88 from frame
+// to frame instead of 44: a submission's write-back puts the mirror's whole sum over zeros the CPU wrote while it ran,
+// where the console's GPU adds into memory. The whole flushed range going up each frame hides it (39 of its 46.8 MiB
+// are pages the GPU wrote last).
+static int flush_trust(void) {
     const char *e = rt_live("TOTK_FLUSH_TRUST");
     return e && *e == '1';
 }
@@ -2368,8 +2374,29 @@ static void flush_audit(uint64_t a, uint64_t b) {
     plat_mutex_unlock(&m);
 }
 
+static int flush_trust(void);
+static uint64_t flush_stamp_bytes, flush_stamp_calls;   // gen_lock
+
 void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size) {
     if (!vk_mirror_on || !size || !p->mem) return;
+    if (flush_trust()) {
+        // LOCAL TEST (Ocarina): with TOTK_FLUSH_TRUST=1 the flush stamps the pages written in its range now, so the next
+        // sync uploads them, as the whole range used to go up at the next sync; unwritten pages stay out. Stamping at the
+        // pool's sync instead moved a CPU write after the flush to a later submission, and Ocarina's scene average (the
+        // CPU zeroes an accumulator the GPU adds to) lost or doubled its frames.
+        uint64_t a = ((uintptr_t)p->mem + off) & ~0xfffull, b = ((uintptr_t)p->mem + off + size + 0xfff) & ~0xfffull;
+        plat_mutex_lock(&gen_lock);
+        uint32_t g = ++gen_now;
+        for (uint64_t x = a; x < b;) {
+            uint64_t n = ww_query(x, b - x);
+            if (n == UINT64_MAX) break;   // untracked: the flush range itself goes up (mirror_sync)
+            for (uint64_t k = 0; k < n; k++) stamp_page(gen_pages[k], g);
+            if (n < sizeof gen_pages / sizeof *gen_pages) break;
+            x = gen_pages[n - 1] + 4096;
+        }
+        flush_stamp_calls++, flush_stamp_bytes += b - a;
+        plat_mutex_unlock(&gen_lock);
+    }
     flush_audit(((uintptr_t)p->mem + off) & ~0xfffull, ((uintptr_t)p->mem + off + size + 0xfff) & ~0xfffull);
     plat_inc64(&m_flush_calls);
     plat_add64(&m_flush_bytes, (int64_t)size);

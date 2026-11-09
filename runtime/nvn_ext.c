@@ -17,6 +17,18 @@
 void nvn_pool_invalidate(const pool_t *p, uint64_t off, uint64_t size) {
     if (!p->mem || nvn_gpu_only((uintptr_t)p->mem) || off >= p->size || !size) return;
     if (size > p->size - off) size = p->size - off;
+    {   // LOCAL TEST (Ocarina): OOT_INV_LOG=<frame>: the invalidates (CPU reads of GPU-written memory) of that frame and the next
+        static long at = -2;
+        if (at == -2) { const char *e = getenv("OOT_INV_LOG"); at = e ? atol(e) : -1; }
+        long f = (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+        if (at >= 0 && f >= at && f < at + 40 && size == 0x1040) {
+            const uint8_t *m = (const uint8_t *)(uintptr_t)p->mem + off;
+            float w[8] = {0};
+            memcpy(w, m, 32);
+            rt_log("inv: frame %ld pool %p+%#llx size %#llx: %g %g %g %g %g %g %g %g", f, (const void *)p->mem, (unsigned long long)off,
+                   (unsigned long long)size, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+        }
+    }
     gfx_backend()->guest_read((uintptr_t)p->mem + off, size);
 }
 
