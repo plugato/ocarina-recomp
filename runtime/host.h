@@ -292,6 +292,9 @@ int rt_knob(const char *name, const char *def);
 // again every 250 ms, so a test changes it with the game running), else the environment; NULL when neither sets it.
 // The returned string stays valid; it may change under the caller between two reads.
 const char *rt_live(const char *name);
+// LOCAL TEST (Ocarina): OOT_TRACE_ADDR=<addr> OOT_TRACE_FRAME=<frame>: rt_trace_addr logs what touches [lo, hi) when it
+// holds the address, for 8 frames from that one, with the 4 floats there.
+void rt_trace_addr(const char *what, uint64_t lo, uint64_t hi, uint64_t extra);
 #define RT_KNOB_ON(mode) ((mode) == 2 ? rt_ab() : (mode))
 void frame_step_present(uint64_t display_ns, int interval); // nvnQueuePresentTexture: the frame's display time and
                                                            // present interval (60 Hz ticks)

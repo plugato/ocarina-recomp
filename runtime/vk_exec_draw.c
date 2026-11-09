@@ -288,6 +288,7 @@ static uint8_t *scratch(VkExec *ex, uint64_t size, VkBuffer *buf, VkDeviceSize *
 
 static void note_written_m(VkExec *ex, uint64_t addr, uint64_t size, int mirrored) {
     CbRes *r = cb_res(ex);
+    rt_trace_addr(mirrored ? "gpu write recorded (mirror)" : "gpu write recorded (direct)", addr, addr + size, ex->fence);
     for (int i = 0; i < r->nwritten; i++)
         if (r->written[i].addr == addr && r->written[i].size == size) {
             r->written[i].mirrored &= mirrored;   // written through the mirror only if every binding of it was

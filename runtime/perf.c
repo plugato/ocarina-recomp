@@ -387,3 +387,18 @@ const char *rt_live(const char *name) {
     plat_mutex_unlock(&live_lock);
     return v ? v : getenv(name);
 }
+
+void rt_trace_addr(const char *what, uint64_t lo, uint64_t hi, uint64_t extra) {
+    static uint64_t addr = ~0ull, from;
+    if (addr == ~0ull) {
+        const char *e = getenv("OOT_TRACE_ADDR"), *f = getenv("OOT_TRACE_FRAME");
+        addr = e ? strtoull(e, NULL, 0) : 0, from = f ? strtoull(f, NULL, 0) : 0;
+    }
+    if (!addr || addr < lo || addr >= hi) return;
+    extern GfxStats gfx_counters;
+    uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    if (fr < from || fr >= from + 8) return;
+    float v[4];
+    memcpy(v, (const void *)(uintptr_t)addr, sizeof v);
+    rt_log("trace: f%llu %s extra %#llx guest %g %g %g %g", (unsigned long long)fr, what, (unsigned long long)extra, v[0], v[1], v[2], v[3]);
+}

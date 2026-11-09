@@ -29,6 +29,7 @@ void nvn_pool_invalidate(const pool_t *p, uint64_t off, uint64_t size) {
                    (unsigned long long)size, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
         }
     }
+    rt_trace_addr("cpu invalidate (before)", (uintptr_t)p->mem + off, (uintptr_t)p->mem + off + size, size);
     gfx_backend()->guest_read((uintptr_t)p->mem + off, size);
 }
 
@@ -80,6 +81,19 @@ NVN_API(nvnMemoryPoolGetSize) { ret_x(c, ((const pool_t *)arg_p(c, 0))->size); }
 // void nvnMemoryPoolInvalidateMappedRange(const NVNmemoryPool *p, ptrdiff_t offset, size_t size)
 NVN_API(nvnMemoryPoolInvalidateMappedRange) {
     int64_t off = (int64_t)arg_x(c, 1);
+    // LOCAL TEST (Ocarina): OOT_INV_WAIT=1 (live): an invalidate waits for all submitted GPU work, as the console's GPU
+    // is done when the CPU reads; =2 only the 0x1040-byte readbacks. Facing the sun in Kokiri Forest (slot of
+    // 2026-11-09) the picture then matches Eglantine (luma 92 vs 88; lag3 alone 150-170), but the forest view washes
+    // out (114 vs 58) and the frame rate halves (~28 fps): the scene-sum readbacks (compute 435a0138b9013040) are only
+    // part of the story. Off by default.
+    {
+        const char *e = rt_live("OOT_INV_WAIT");
+        int mode = e ? atoi(e) : 0;
+        if (mode == 1 || (mode == 2 && arg_x(c, 2) == 0x1040)) {
+            NVN_BLOCKING();
+            gfx_backend()->finish();
+        }
+    }
     if (off >= 0) nvn_pool_invalidate(arg_p(c, 0), (uint64_t)off, arg_x(c, 2));
 }
 // void nvnBufferInvalidateMappedRange(const NVNbuffer *b, ptrdiff_t offset, size_t size): buffers are pool storage,

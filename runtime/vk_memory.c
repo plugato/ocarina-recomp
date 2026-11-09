@@ -1337,6 +1337,7 @@ int vk_mem_span_mirrored(const VkMemSpan *sp) {   // replay thread: the span nam
 }
 
 void vk_gpu_written_mirrored(uint64_t addr, uint64_t size) {   // completion thread
+    rt_trace_addr("gpu write done (completion)", addr, addr + size, size);
     if (shadow_on || !vk_mirror_on || !size || !mirror_wb_skip() || nvn_gpu_only(addr)) {
         vk_gpu_written(addr, size);
         return;
@@ -2395,6 +2396,7 @@ static int flush_trust(void);
 static uint64_t flush_stamp_bytes, flush_stamp_calls;   // gen_lock
 
 void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size) {
+    rt_trace_addr("cpu flush", (uintptr_t)p->mem + off, (uintptr_t)p->mem + off + size, size);
     if (!vk_mirror_on || !size || !p->mem) return;
     if (flush_trust()) {
         // LOCAL TEST (Ocarina): with TOTK_FLUSH_TRUST=1 the flush stamps the pages written in its range now, so the next
@@ -2673,6 +2675,7 @@ Capture *vk_mem_capture(void) {
         uint64_t at = 0;
         for (int i = 0; i < c->n; i++) {
             c->run[i].soff = at;
+            rt_trace_addr("capture (submit)", c->run[i].addr, c->run[i].addr + c->run[i].size, cap_n_acc);
             memcpy(c->map + at, (const void *)(uintptr_t)c->run[i].addr, c->run[i].size);
             at += c->run[i].size;
         }
@@ -2710,6 +2713,8 @@ static void capture_apply(VkCommandBuffer cb, uint64_t fence) {
         }
         PoolRec *r = lo ? mlist[lo - 1] : NULL;
         uint64_t wlo = r ? r->import_lo + r->mirror_lo : 0, whi = r ? r->import_lo + r->mirror_hi : 0;
+        rt_trace_addr(r && r->mstate == MS_ON && !r->nwin && addr >= wlo && addr < whi ? "capture applied" : "capture NOT applied (no mirror)",
+                      addr, addr + c->run[i].size, r ? wlo : 0);
         if (!r || r->mstate != MS_ON || r->nwin || addr < wlo || addr >= whi) { i++; continue; }   // retired since
         int k = 0;
         for (; i < c->n && c->run[i].addr >= wlo && c->run[i].addr < whi; i++) {
