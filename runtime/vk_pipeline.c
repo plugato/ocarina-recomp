@@ -3894,7 +3894,7 @@ static struct {
 // time, so memory stays bounded, and its dispatches are skipped until the pipeline is in the live table.
 // ponytail: a linear table of 1024 shaders and a polling worker; a dispatch skipped this way loses its effect for those frames.
 enum { BIG_CS_N = 1024 };
-static struct { const GfxShader *cs; volatile int done; } big_cs[BIG_CS_N];
+static struct { const GfxShader *cs; volatile int done; uint64_t words; int started; } big_cs[BIG_CS_N];
 static volatile int big_cs_n;
 static int big_cs_thread;
 
@@ -3920,13 +3920,29 @@ static VkPipelineCache cache_copy(void) {
     return c;
 }
 
+// The smallest pending shader first: in queue order, Ocarina 1.1.1's movie upscaler (two shaders of ~340k words, minutes
+// each without optimization on an RTX 3070) came before the vegetation culling (156k words), whose dispatches were
+// skipped meanwhile: the plants stood still and dark for minutes after a load. TOTK_BIG_CS_FIFO=1 keeps the queue order.
+static int big_cs_pick(void) {
+    static int fifo = -1;
+    if (fifo < 0) { const char *e = getenv("TOTK_BIG_CS_FIFO"); fifo = e && *e == '1'; }
+    int n = __atomic_load_n(&big_cs_n, __ATOMIC_ACQUIRE), best = -1;
+    for (int i = 0; i < n; i++) {
+        if (big_cs[i].started) continue;
+        if (fifo) return i;
+        if (best < 0 || big_cs[i].words < big_cs[best].words) best = i;
+    }
+    return best;
+}
+
 static void big_cs_worker(void *arg) {
     (void)arg;
-    for (int next = 0;;) {
-        if (next >= __atomic_load_n(&big_cs_n, __ATOMIC_ACQUIRE)) {
+    for (int next;;) {
+        if ((next = big_cs_pick()) < 0) {
             plat_sleep_ms(20);
             continue;
         }
+        big_cs[next].started = 1;
         const GfxShader *cs = big_cs[next].cs;
         const char *why = NULL;
         Bindings B = {0};
@@ -3934,6 +3950,7 @@ static void big_cs_worker(void *arg) {
         Layout *l = compute_layout(cs, &B, &why);
         plat_mutex_unlock(&P.lock);
         uint64_t t0 = plat_now_ns();
+        if (rt_trace & RT_TRACE_PERF) rt_log("vk_pipeline: big compute shader %d: building", next);
         // A cache of its own: a compile of minutes inside the shared cache held every other pipeline on the replay thread
         // behind it, and the game froze for over a minute. The result is merged into the shared one when it is done.
         VkPipelineCache own = cache_private();   // upstream v0.2.4: seeded from pipeline-cache.bin
@@ -3961,7 +3978,6 @@ static void big_cs_worker(void *arg) {
             if (built) cache_publish(own);
             else vkDestroyPipelineCache(P.device, own, NULL);
         }
-        next++;
     }
 }
 
@@ -4177,8 +4193,10 @@ int vk_pipeline_compute_ready(const GfxShader *cs) {
     if (n == BIG_CS_N) return 1;
     if (!big_cs_thread) big_cs_thread = plat_thread_spawn(big_cs_worker, NULL, "big compute", 0) ? 1 : -1;
     if (big_cs_thread < 0) return 1;
-    big_cs[n].cs = cs;
+    big_cs[n].cs = cs, big_cs[n].words = words;
     __atomic_store_n(&big_cs_n, n + 1, __ATOMIC_RELEASE);
+    rt_log("vk_pipeline: big compute shader %d queued (%llu words): its dispatches are skipped until it is built", n,
+           (unsigned long long)words);
     return 0;
 }
 
