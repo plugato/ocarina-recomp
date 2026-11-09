@@ -1316,6 +1316,53 @@ static void shadow_write_back(PoolRec *r, uint64_t addr, uint64_t size) {
     }
 }
 
+// LOCAL TEST (Ocarina): a storage write through a pool's VRAM mirror goes back into guest memory at the end of its
+// submission (vk_mem_mirror_end), and at the fence vk_gpu_written stamped the whole range written so textures see it.
+// The stamp also made the next mirror_sync upload the same bytes into the mirror they came from: once the forest's
+// culling computes ran, 73 MiB a frame went back and 72 MiB came in again, the frame went from 18 to 39 ms. mw_chunk
+// holds, per page, the generation of a stamp from such a write-back; mirror_sync skips a page whose newest stamp is
+// that one. A page is marked only when the mirror already held every write stamped before (its generation was at or
+// below the pool's mgen, or was itself a write-back's): a CPU write the mirror has not seen keeps its upload, and one
+// seen later gets a newer stamp. TOTK_MIRROR_WB_RESYNC=1 uploads them again as before.
+static uint32_t *mw_chunk[GEN_CHUNKS];   // gen_lock
+
+static int mirror_wb_skip(void) {   // live (OOT_LIVE)
+    const char *e = rt_live("TOTK_MIRROR_WB_RESYNC");
+    return !(e && *e == '1');
+}
+
+int vk_mem_span_mirrored(const VkMemSpan *sp) {   // replay thread: the span names its pool's mirror
+    const PoolRec *r = sp->pool;
+    return vk_mirror_on && r && r->mstate == MS_ON && !r->nwin && r->mbuf && sp->buffer == r->mbuf;
+}
+
+void vk_gpu_written_mirrored(uint64_t addr, uint64_t size) {   // completion thread
+    if (shadow_on || !vk_mirror_on || !size || !mirror_wb_skip() || nvn_gpu_only(addr)) {
+        vk_gpu_written(addr, size);
+        return;
+    }
+    uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
+    plat_mutex_lock_shared(&pool_lock);
+    const pidx_ent *e = pidx_find(&pool_index, addr, size);
+    const PoolRec *r = e ? e->buf : NULL;
+    uint64_t wlo = 0, whi = 0;
+    if (r && r->mstate == MS_ON && !r->nwin) wlo = r->import_lo + r->mirror_lo, whi = r->import_lo + r->mirror_hi;
+    plat_mutex_lock(&gen_lock);
+    uint32_t g = ++gen_now, mg = r ? r->mgen : 0;
+    for (uint64_t a = lo; a < hi; a += 1ull << GEN_PAGE_SHIFT) {
+        uint32_t *s = gen_slot(a, 1);
+        if (!s) continue;
+        uint32_t prev = *s;
+        stamp_page(a, g);
+        if (a < wlo || a >= whi) continue;
+        uint64_t ci = a >> GEN_CHUNK_SHIFT, pi = (a >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1);
+        if (!mw_chunk[ci] && !(mw_chunk[ci] = calloc(GEN_PER_CHUNK, sizeof(uint32_t)))) continue;
+        if (prev <= mg || mw_chunk[ci][pi] == prev) mw_chunk[ci][pi] = g;
+    }
+    plat_mutex_unlock(&gen_lock);
+    plat_mutex_unlock_shared(&pool_lock);
+}
+
 void vk_gpu_written(uint64_t addr, uint64_t size) {
     if (shadow_on && size) {
         plat_mutex_lock_shared(&pool_lock);
@@ -1522,6 +1569,7 @@ typedef struct {
     uint64_t presnap_queries, sync_queries, presnap_t, sync_t, prologues, presnap_bytes;
     uint64_t snap_bytes, merge_bytes, merge_dispatches, snap_allocs;   // write-back merge
     uint64_t page_bytes, flush_n, flush_bytes, flush_calls, flush_sum;   // what mirror_sync queues, by source
+    uint64_t wb_kept;                  // written pages mirror_sync left alone: their newest stamp is a write-back from the mirror
 } MirrorAcc;
 static MirrorAcc mrep;                 // replay: this submission
 static MirrorAcc macc;                 // mirror_stat_lock: since the last summary
@@ -1804,9 +1852,34 @@ static void mirror_sync(PoolRec *r) {
         if (b > hi) b = hi;
         const uint32_t *ch = gen_chunk[a >> GEN_CHUNK_SHIFT];   // a 2 MiB region lies in one chunk
         if (!ch) continue;
-        for (uint64_t x = a; x < b; x += 1ull << GEN_PAGE_SHIFT)
-            if (ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)] > since)
-                range_add(&pend, &npend, &cpend, r, x - lo, 1ull << GEN_PAGE_SHIFT), mrep.page_bytes += 1ull << GEN_PAGE_SHIFT;
+        const uint32_t *mw = mw_chunk[a >> GEN_CHUNK_SHIFT];   // vk_gpu_written_mirrored: stamps the mirror already holds
+        for (uint64_t x = a; x < b; x += 1ull << GEN_PAGE_SHIFT) {
+            uint32_t pi = (x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1), gv = ch[pi];
+            if (gv <= since) continue;
+            if (mw && mw[pi] == gv) { mrep.wb_kept += 1ull << GEN_PAGE_SHIFT; continue; }
+            range_add(&pend, &npend, &cpend, r, x - lo, 1ull << GEN_PAGE_SHIFT), mrep.page_bytes += 1ull << GEN_PAGE_SHIFT;
+        }
+    }
+    {   // LOCAL TEST (Ocarina): OOT_WB_LOG=<frame>: the written pages each sync of that frame uploads, as runs
+        static long at = -2;
+        if (at == -2) { const char *e = getenv("OOT_WB_LOG"); at = e ? atol(e) : -1; }
+        if (at >= 0 && (long)mirror_frame == at)
+            for (uint64_t k = r0; k <= r1; k++) {
+                if (reg_max[k] <= since) continue;
+                uint64_t a = k << SNAP_SHIFT, b = a + (1ull << SNAP_SHIFT);
+                if (a < lo) a = lo;
+                if (b > hi) b = hi;
+                const uint32_t *ch = gen_chunk[a >> GEN_CHUNK_SHIFT];
+                if (!ch) continue;
+                uint64_t run = 0, n = 0;
+                for (uint64_t x = a; x <= b; x += 1ull << GEN_PAGE_SHIFT) {
+                    int w = x < b && ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)] > since;
+                    if (w && !n) run = x;
+                    if (w) n++;
+                    else if (n) rt_log("up: %#llx +%#llx (pool %#llx..%#llx)", (unsigned long long)run,
+                                       (unsigned long long)(n << GEN_PAGE_SHIFT), (unsigned long long)lo, (unsigned long long)hi), n = 0;
+                }
+            }
     }
     r->mgen = gen_now;
     if (excl) plat_mutex_unlock(&gen_lock);
@@ -1897,7 +1970,12 @@ int vk_mem_mirror_probe(uint64_t addr) {
 #define SNAP_CHUNK (1u << 20)
 #define MERGE_SPAN (64ull << 20)   // the bytes of one pool a merge dispatch binds at most
 #define MERGE_WORDS (65535u * 64u) // the words one merge dispatch covers at most
-#define MERGE_MAX (4ull << 20)     // larger written ranges stay plain copies
+// Larger written ranges stay plain copies. LOCAL TEST (Ocarina): OOT_MERGE_MAX_MIB sets it (default 4).
+static uint64_t merge_max(void) {   // live (OOT_LIVE)
+    const char *e = rt_live("OOT_MERGE_MAX_MIB");
+    return (e && atoi(e) > 0 ? (uint64_t)atoi(e) : 4) << 20;
+}
+#define MERGE_MAX merge_max()
 typedef struct { PoolRec *r; uint64_t off, size, soff; int chunk; } SnapRange;
 typedef struct { VkBuffer buf; VmaAllocation alloc; uint64_t size, used; int host; } SnapChunk;
 typedef struct { int n; SnapChunk c[]; } SnapFree;   // a submission's chunks and range lists, pooled at its fence
@@ -2269,11 +2347,113 @@ void vk_mem_mirror_begin(void) {
 
 int vk_mem_mirror_pending(void) { return npend || snl_copied < nsnl; }
 
-void vk_mem_mirror_prologue(VkCommandBuffer cb) {
+// LOCAL TEST (Ocarina): OOT_MIRROR_STAGE=1: the CPU -> mirror copies read guest memory now, at the part's submit, into a
+// host chunk, and the GPU copies that into the mirror: what the game writes after the submit returns cannot reach a
+// submission still waiting for the GPU (a plain copy reads guest memory when the GPU runs the prologue).
+static int mirror_stage(void) {   // live (OOT_LIVE)
+    const char *e = rt_live("OOT_MIRROR_STAGE");
+    return e && *e == '1';
+}
+
+// Host buffers for the staged uploads, back on stage_list at their submission's fence (the last part's prologue runs
+// after vk_mem_mirror_end handed the snapshot chunks over, so they are kept apart).
+typedef struct StageBuf { struct StageBuf *next; VkBuffer buf; VmaAllocation alloc; uint8_t *map; uint64_t size; } StageBuf;
+static StageBuf *stage_list;
+static uint64_t stage_kept;
+static PlatMutex stage_lock = PLAT_MUTEX_INIT;
+
+static void stage_release(void *arg) {   // completion thread
+    StageBuf *b = arg;
+    plat_mutex_lock(&stage_lock);
+    int keep = stage_kept + b->size <= (512ull << 20);
+    if (keep) b->next = stage_list, stage_list = b, stage_kept += b->size;
+    plat_mutex_unlock(&stage_lock);
+    if (!keep) {
+        vmaDestroyBuffer(vk_ctx()->vma, b->buf, b->alloc);
+        free(b);
+    }
+}
+
+static StageBuf *stage_get(uint64_t size) {
+    plat_mutex_lock(&stage_lock);
+    StageBuf **best = NULL;
+    for (StageBuf **p = &stage_list; *p; p = &(*p)->next)
+        if ((*p)->size >= size && (!best || (*p)->size < (*best)->size)) best = p;
+    StageBuf *b = best ? *best : NULL;
+    if (b) *best = b->next, stage_kept -= b->size;
+    plat_mutex_unlock(&stage_lock);
+    if (b) return b;
+    uint64_t want = 4ull << 20;
+    while (want < size) want <<= 1;
+    b = calloc(1, sizeof *b);
+    if (!b) return NULL;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = want,
+                             .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                  .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+    VmaAllocationInfo info;
+    if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &b->buf, &b->alloc, &info) != VK_SUCCESS || !info.pMappedData) {
+        if (b->buf) vmaDestroyBuffer(vk_ctx()->vma, b->buf, b->alloc);
+        free(b);
+        return NULL;
+    }
+    b->map = info.pMappedData, b->size = want;
+    return b;
+}
+
+static int stage_ranges(VkCommandBuffer cb, MRange *a, int n, uint64_t fence) {
+    qsort(a, (size_t)n, sizeof *a, range_cmp);
+    uint64_t total = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        uint8_t *map = NULL;
+        VkBuffer sbuf = VK_NULL_HANDLE;
+        if (pass) {
+            StageBuf *b = stage_get(total);
+            if (!b) return 0;
+            map = b->map, sbuf = b->buf;
+            vk_completion_add(fence, stage_release, b);
+        }
+        uint64_t at = 0;
+        for (int i = 0; i < n;) {
+            PoolRec *r = a[i].r;
+            uint64_t lim = r->mirror_hi - r->mirror_lo;
+            int k = 0;
+            for (; i < n && a[i].r == r; i++) {
+                uint64_t lo = a[i].off, hi = a[i].off + a[i].size;
+                if (hi > lim) hi = lim;
+                if (lo >= hi) continue;
+                if (k && lo <= mregions[k - 1].dstOffset + mregions[k - 1].size) {
+                    uint64_t end = mregions[k - 1].dstOffset + mregions[k - 1].size;
+                    if (hi > end) mregions[k - 1].size += hi - end;
+                    continue;
+                }
+                if (k == cregions) grow((void **)&mregions, &cregions, sizeof *mregions);
+                mregions[k++] = (VkBufferCopy){0, lo, hi - lo};
+            }
+            for (int j = 0; j < k; j++) {
+                mregions[j].srcOffset = at;
+                if (pass) memcpy(map + at, (const void *)(uintptr_t)(r->import_lo + r->mirror_lo + mregions[j].dstOffset),
+                                 mregions[j].size);
+                at += (mregions[j].size + 15) & ~15ull;
+            }
+            if (pass && k) {
+                vkCmdCopyBuffer(cb, sbuf, r->mbuf, (uint32_t)k, mregions);
+                for (int j = 0; j < k; j++) mrep.upload_bytes += mregions[j].size;
+                mrep.upload_copies += (uint64_t)k;
+            }
+        }
+        total = at;
+        if (!total) return 1;
+    }
+    return 1;
+}
+
+void vk_mem_mirror_prologue(VkCommandBuffer cb, uint64_t fence) {
     if (!npend && snl_copied == nsnl) return;
     mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
              VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    copy_ranges(cb, pend, npend, 1, &mrep.upload_bytes, &mrep.upload_copies);
+    if (!npend || !mirror_stage() || !stage_ranges(cb, pend, npend, fence))
+        copy_ranges(cb, pend, npend, 1, &mrep.upload_bytes, &mrep.upload_copies);
     if (snl_copied < nsnl) {   // the snapshots read what the uploads above wrote
         if (npend) mbarrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
                             VK_ACCESS_2_TRANSFER_READ_BIT);
@@ -2466,8 +2646,9 @@ static void mirror_log(uint64_t frame) {
            a.presnap_queries / f, a.presnap_bytes / f / M, a.sync_queries / f, a.prologues / f, qpc_ms(a.presnap_t + a.sync_t) / f,
            qpc_ms(a.presnap_t) / f, qpc_ms(a.sync_t) / f, ver);
     rt_log("mem: mirror frame %llu: upload sources per frame, overlaps counted twice: written pages %.3f MiB; flush ranges "
-           "%.2f, %.3f MiB, from %.1f flushes of %.3f MiB", (unsigned long long)frame, a.page_bytes / f / M, a.flush_n / f,
-           a.flush_bytes / f / M, a.flush_calls / f, a.flush_sum / f / M);
+           "%.2f, %.3f MiB, from %.1f flushes of %.3f MiB; written back from the mirror, not uploaded again %.3f MiB",
+           (unsigned long long)frame, a.page_bytes / f / M, a.flush_n / f, a.flush_bytes / f / M, a.flush_calls / f,
+           a.flush_sum / f / M, a.wb_kept / f / M);
 }
 
 // With TOTK_TRACE=perf every 600 frames: what holds device-local memory, to see what grows over a long session.

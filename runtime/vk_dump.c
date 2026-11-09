@@ -455,6 +455,53 @@ static void buf_snap(VkExec *ex, int pass) {
     vk_completion_add(ex->fence, buf_done, j);
 }
 
+// LOCAL TEST (Ocarina): vk_dump_range: the GPU's view of [addr, addr+size) copied at this point of the command buffer and
+// written to <dump dir>/ds_<tag>_<addr>.bin once the submission is done (vk_exec_draw.c OOT_DISP_SNAP).
+typedef struct { VkBuffer buf; VmaAllocation alloc; const uint8_t *map; uint64_t size; char name[96]; } RangeJob;
+static void range_done(void *arg) {
+    RangeJob *j = arg;
+    vmaInvalidateAllocation(vk_ctx()->vma, j->alloc, 0, VK_WHOLE_SIZE);
+    char path[600];
+    snprintf(path, sizeof path, "%s/%s", dir, j->name);
+    FILE *f = fopen(path, "wb");
+    if (f) fwrite(j->map, 1, j->size, f), fclose(f);
+    vmaDestroyBuffer(vk_ctx()->vma, j->buf, j->alloc);
+    free(j);
+}
+int vk_dump_range(VkExec *ex, const char *tag, uint64_t addr, uint64_t size) {
+    if (!dir[0] || !addr || !size) return 0;
+    VkMemSpan s;
+    if (!vk_mem_resolve(addr, size, &s)) return 0;
+    if (s.avail < size) size = s.avail;
+    VK_MEM_PICK(s);
+    RangeJob *j = calloc(1, sizeof *j);
+    if (!j) return 0;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO,
+                                  .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+    VmaAllocationInfo info;
+    if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &j->buf, &j->alloc, &info) != VK_SUCCESS || !info.pMappedData) { free(j); return 0; }
+    j->map = info.pMappedData, j->size = size;
+    snprintf(j->name, sizeof j->name, "ds_%s_%llx.bin", tag, (unsigned long long)addr);
+    VkMemoryBarrier2 mb[2] = {
+        {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+         .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+         .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT},
+        {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+         .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+         .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+         .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT}};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb[0]};
+    vkCmdPipelineBarrier2(ex->cb, &di);
+    VkBufferCopy c = {s.offset, 0, size};
+    vkCmdCopyBuffer(ex->cb, s.buffer, j->buf, 1, &c);
+    di.pMemoryBarriers = &mb[1];
+    vkCmdPipelineBarrier2(ex->cb, &di);
+    ex->recorded += 3;
+    vk_completion_add(ex->fence, range_done, j);
+    return 1;
+}
+
 static int active(void) {
     uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
     return !finished && (f == dump_frame || (log_from && f >= log_from && f < dump_frame));

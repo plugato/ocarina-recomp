@@ -98,7 +98,7 @@ typedef struct {
     uint32_t aspect, level0, levels, layer0, layers, swz;
 } ViewKey;
 _Static_assert(sizeof(ViewKey) == 40, "ViewKey is hashed as bytes: no padding");
-typedef struct { uint64_t addr, size; } Range;
+typedef struct { uint64_t addr, size; int mirrored; } Range;   // mirrored: written through its pool's VRAM mirror
 typedef struct {
     Chunk *chunks;
     int nchunks, cchunks;
@@ -207,7 +207,9 @@ static uint64_t bind_gen = 1;            // bumped by every bind op that writes 
 static void cb_done(void *arg) {   // completion thread
     CbRes *r = arg;
     VkCtx *c = vk_ctx();
-    for (int i = 0; i < r->nwritten; i++) vk_gpu_written(r->written[i].addr, r->written[i].size);
+    for (int i = 0; i < r->nwritten; i++)
+        if (r->written[i].mirrored) vk_gpu_written_mirrored(r->written[i].addr, r->written[i].size);
+        else vk_gpu_written(r->written[i].addr, r->written[i].size);
     for (int i = 0; i < r->npools; i++) {
         vkResetDescriptorPool(c->device, r->pools[i], 0);
         plat_mutex_lock(&spare_lock);
@@ -284,14 +286,18 @@ static uint8_t *scratch(VkExec *ex, uint64_t size, VkBuffer *buf, VkDeviceSize *
     return p;
 }
 
-static void note_written(VkExec *ex, uint64_t addr, uint64_t size) {
+static void note_written_m(VkExec *ex, uint64_t addr, uint64_t size, int mirrored) {
     CbRes *r = cb_res(ex);
     for (int i = 0; i < r->nwritten; i++)
-        if (r->written[i].addr == addr && r->written[i].size == size) return;
+        if (r->written[i].addr == addr && r->written[i].size == size) {
+            r->written[i].mirrored &= mirrored;   // written through the mirror only if every binding of it was
+            return;
+        }
     if (r->nwritten == r->cwritten) r->written = grow(r->written, &r->cwritten, sizeof *r->written);
-    r->written[r->nwritten++] = (Range){addr, size};
+    r->written[r->nwritten++] = (Range){addr, size, mirrored};
     vk_mem_gpu_pending(addr, size);
 }
+static void note_written(VkExec *ex, uint64_t addr, uint64_t size) { note_written_m(ex, addr, size, 0); }
 
 static int reset_mapped(void *context, uint64_t addr, uint32_t size) {
     (void)context;
@@ -1008,6 +1014,7 @@ static void count_use(int cls, int use, uint64_t n) {
 // written: the shader stores into it (a mirror's range goes back to guest memory at the end of the submission).
 // direct_only: guarded aliases must share the real backing; a transient copy would lose writes and alias coherence.
 #define WRITTEN_CAP (8ull << 20)
+static int bind_mirrored;   // the last bind_range named its pool's VRAM mirror (vk_mem_span_mirrored), for note_written_m
 static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, uint64_t max, int use, int written,
                       int direct_only, VkDescriptorBufferInfo *out) {
     VkMemSpan sp;
@@ -1015,14 +1022,24 @@ static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, 
     uint64_t n = size && size < sp.avail ? size : sp.avail;
     if (n > max) n = max;
     if (!n) return 0;
+    bind_mirrored = 0;
     if (sp.offset % align == 0) {
         VK_MEM_USE(sp);
+        bind_mirrored = vk_mem_span_mirrored(&sp);
         *out = (VkDescriptorBufferInfo){sp.buffer, sp.offset, n};
         {   // LOCAL TEST (Ocarina): a guarded binding with no declared size reaches the end of its pool (1.4 GB at 0x200000000): marked written,
             // it was copied back every submission and uploaded again, 3.2 GB a frame. Bound whole for reads; 8 MiB count as written,
             // the cap Lichii and oot-pc-recomp use. ponytail: a store past it stays in the mirror and is not seen by the CPU.
             uint64_t wrote = direct_only && n > WRITTEN_CAP ? WRITTEN_CAP : n;
             if (written) vk_mem_gpu_wrote_shader(&sp, wrote), vk_usnap_drop(addr, wrote);
+            {   // LOCAL TEST (Ocarina): OOT_WB_LOG=<frame>: every written binding of that frame (what the mirror copies back)
+                static long at = -2;
+                if (at == -2) { const char *e = getenv("OOT_WB_LOG"); at = e ? atol(e) : -1; }
+                if (written && at >= 0 && (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) == at)
+                    rt_log("wb: %#llx +%#llx (asked %#llx, avail %#llx) direct_only %d use %d prog %llu", (unsigned long long)addr,
+                           (unsigned long long)wrote, (unsigned long long)size, (unsigned long long)sp.avail, direct_only, use,
+                           (unsigned long long)(ex->prog ? ex->prog->serial : 0));
+            }
         }
         count_use(sp.cls, use, n);
         VK_MEM_BOUND(sp);
@@ -1222,6 +1239,12 @@ static void dyn_collect(VkExec *ex, const VkPipeInfo *info, int st) {
                     }
                     rt_log("dyncov:  %s%d %llx size %llx read %llx pointers %llu not covered %llu first %llx at +%llx", t ? "ssbo" : "ubo", k, (unsigned long long)u->addr,
                            (unsigned long long)u->size, (unsigned long long)len, (unsigned long long)ptrs, (unsigned long long)miss, (unsigned long long)first, (unsigned long long)firsto);
+                    if (!t && logs <= 2 && len <= 0x200)   // the small uniform blocks of the first dispatches, as 64-bit words
+                        for (uint64_t o = 0; o + 32 <= len; o += 32) {
+                            const uint64_t *q = (const uint64_t *)(uintptr_t)(u->addr + o);
+                            rt_log("dyncov:    ubo%d +%03llx %016llx %016llx %016llx %016llx", k, (unsigned long long)o, (unsigned long long)q[0],
+                                   (unsigned long long)q[1], (unsigned long long)q[2], (unsigned long long)q[3]);
+                        }
                 }
         }
     }
@@ -1355,6 +1378,17 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
         return (VkDescriptorBufferInfo){b, o, sizeof blk};
     } else if (slot >= 3 && slot - 3 < 18) {
         const p_bind_buf *b = &ex->ubo[st][slot - 3];
+        {   // LOCAL TEST (Ocarina): OOT_UBO_EXT=<bytes>: compute uniform blocks smaller than that are bound to that extent of
+            // guest memory. Ocarina's vegetation culling reads its c3 at 0x1220-0x12c0 though the block is declared 0x700;
+            // on the console (and in Eglantine) the read lands in the memory that follows, here it read 0 and every
+            // thread exited.
+            static uint64_t ext = ~0ull;
+            if (ext == ~0ull) { const char *e = getenv("OOT_UBO_EXT"); ext = e ? strtoull(e, NULL, 0) : 0; }
+            if (ext && st == NVN_STAGE_CS && b->addr && b->size && b->size < ext) {
+                uint64_t n = dyn_readable(b->addr, ext < max ? ext : max);
+                if (n > b->size && bind_range(ex, b->addr, n, align, max, VK_MUSE_UBO, 0, 0, &bi)) return bi;
+            }
+        }
         if (b->size && vk_usnap_find(b->addr, b->size < max ? b->size : max, align, &bi)) {   // as of the submit call
             count_use(VK_MCLS_SCRATCH, VK_MUSE_UBO, bi.range);
             if (st == NVN_STAGE_FS && slot == 3 && ex->prog) oot_tonemap_exposure(ex, &bi);
@@ -1377,8 +1411,10 @@ static void oot_tonemap_exposure(VkExec *ex, VkDescriptorBufferInfo *bi) {
     static float scale = -1;
     static const void *last_prog;
     static int last_hit;
-    if (scale < 0) {
-        const char *e = getenv("OOT_EV");
+    static char was[24];
+    const char *e = rt_live("OOT_EV");   // live (OOT_LIVE)
+    if (scale < 0 || strncmp(was, e ? e : "", sizeof was - 1)) {
+        snprintf(was, sizeof was, "%s", e ? e : "");
         scale = e && atof(e) != 0 ? exp2f((float)atof(e)) : 0;
     }
     if (!scale) return;
@@ -1393,6 +1429,19 @@ static void oot_tonemap_exposure(VkExec *ex, VkDescriptorBufferInfo *bi) {
     float z;
     if (!m) return;
     memcpy(&z, m + 56, 4);
+    {   // LOCAL TEST (Ocarina): OOT_EV_LOG=1: what the game left there, every 300th tone map
+        static int lg = -1, n;
+        if (lg < 0) lg = getenv("OOT_EV_LOG") != NULL;
+        if (lg && n++ % 300 == 0) {
+            float f[32] = {0};
+            memcpy(f, m, bi->range < sizeof f ? bi->range : sizeof f);
+            char line[600];
+            int o = 0;
+            for (int i = 0; i < 32 && o < (int)sizeof line - 16; i++) o += snprintf(line + o, sizeof line - (size_t)o, " %.4g", f[i]);
+            rt_log("ev: tone map c3[3].z = %g (frame %llu) range %llu:%s", z, (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED),
+                   (unsigned long long)bi->range, line);
+        }
+    }
     if (z == 1.0f) memcpy(m + 56, &scale, 4);
 }
 
@@ -1489,7 +1538,11 @@ static p_bind_buf guarded_storage_binding(const VkExec *ex, int st, const GfxSha
         if (off >= ub && off < end && (off - ub) % 16 == 0) {
             uint32_t bytes;
             memcpy(&bytes, bank + off + 8, 4);
-            b.size = bytes;   // preserve a typed table's declared extent, not the remainder of its pool
+            // preserve a typed table's declared extent, not the remainder of its pool. LOCAL TEST (Ocarina): OOT_C0_FULL=1 binds
+            // to the end of the backing instead (Eglantine #351 binds table pointers as far as a storage buffer reaches).
+            static int full = -1;
+            if (full < 0) full = getenv("OOT_C0_FULL") != NULL;
+            b.size = full ? 0 : bytes;
         }
         if (off >= DYN_C0 && off < DYN_C0 + sizeof dyn_lists[0] && (off - DYN_C0) % 16 == 0) memcpy(&b.size, bank + off + 8, 8);
     } else if (r->cbuf_slot == 1 && ex->prog) {
@@ -1562,7 +1615,7 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
                     if (wb_at >= 0 && wf >= wb_at && wf < wb_at + 2 && bi.range >= 0x100000 && wb_n++ < 400)
                         rt_log("wb: stage %d guarded %d c%d+%#x addr %#llx size %#llx range %#llx prog %llu", st, guarded, r->cbuf_slot, r->handle * 4, (unsigned long long)b->addr, (unsigned long long)b->size, (unsigned long long)bi.range, ex->prog ? (unsigned long long)ex->prog->serial : 0ull);
                 }
-                note_written(ex, b->addr - lead, guarded && bi.range > WRITTEN_CAP ? WRITTEN_CAP : bi.range);
+                note_written_m(ex, b->addr - lead, guarded && bi.range > WRITTEN_CAP ? WRITTEN_CAP : bi.range, bind_mirrored);
                 const uint8_t *ctl, *code;
                 uint32_t len;
                 if (vk_sync_noting() && ex->prog && find_stage(ex->prog, st, &ctl, &code, &len))
@@ -4185,6 +4238,26 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (skip < 0) skip = getenv("DKB_SKIP_COMPUTE") != NULL;
     if (skip) return;
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
+    if (vk_dump_armed) {   // LOCAL TEST (Ocarina): in the dump frame, OOT_FOLLOW_SSBO=<k>:<slot> follows the storage buffer bound at that
+        // slot of the k-th direct dispatch; OOT_FOLLOW_UPTR=<k>:<slot>:<offset> the pointer that uniform block holds at that offset
+        extern void vk_dump_buf_follow(uint64_t);
+        static long seen_frame = -1, k;
+        long fr = (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+        if (fr != seen_frame) seen_frame = fr, k = 0;
+        long want, slot, off = 0;
+        const char *e = ENV_ONCE("OOT_FOLLOW_SSBO"), *u = ENV_ONCE("OOT_FOLLOW_UPTR");
+        // <k> is the dispatch's group count x when it is 100 or more, else the index of the direct dispatch in the frame
+        if (e && sscanf(e, "%ld:%ld", &want, &slot) == 2 && (want >= 100 ? want == (long)d->x : want == k) && slot >= 0 && slot < 16)
+            vk_dump_buf_follow(ex->ssbo[NVN_STAGE_CS][slot].addr);
+        if (u && sscanf(u, "%ld:%ld:%li", &want, &slot, &off) == 3 && (want >= 100 ? want == (long)d->x : want == k) && slot >= 0 && slot < 16 &&
+            ex->ubo[NVN_STAGE_CS][slot].addr && dyn_readable(ex->ubo[NVN_STAGE_CS][slot].addr + (uint64_t)off, 8) >= 8)
+            vk_dump_buf_follow(*(const uint64_t *)(uintptr_t)(ex->ubo[NVN_STAGE_CS][slot].addr + (uint64_t)off));
+        const char *ub = ENV_ONCE("OOT_FOLLOW_UBO");   // <groups x>:<slot>:<offset>: the uniform block's address plus offset
+        if (ub && sscanf(ub, "%ld:%ld:%li", &want, &slot, &off) == 3 && want == (long)d->x && slot >= 0 && slot < 16 &&
+            ex->ubo[NVN_STAGE_CS][slot].addr)
+            vk_dump_buf_follow(ex->ubo[NVN_STAGE_CS][slot].addr + (uint64_t)off);
+        k++;
+    }
     cb_res(ex);
     dummies_init();
     int present;
@@ -4289,11 +4362,89 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     c0_dim[0] = (uint32_t)d->x, c0_dim[1] = (uint32_t)d->y, c0_dim[2] = (uint32_t)d->z;
     c0_lay_set(ex, cs);
     if (c0_lay) dyn_collect(ex, info, NVN_STAGE_CS);
+    {   // LOCAL TEST (Ocarina): OOT_DYN_LIST=<frame>:<groups x>: that dispatch's reachable-buffer list and the pointers its c4 holds
+        static long at = -2, gx, until = -1;   // OOT_DYN_LIST=<frame>[-<last>]:<groups x>; groups 0 lists the dispatches
+        if (at == -2) {
+            const char *e = getenv("OOT_DYN_LIST");
+            at = -1;
+            if (e && sscanf(e, "%ld-%ld:%ld", &at, &until, &gx) != 3) { until = -1; sscanf(e, "%ld:%ld", &at, &gx); }
+        }
+        long fr_now = (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+        if (at >= 0 && !gx && fr_now >= at && fr_now <= (until >= 0 ? until : at) && d->x >= 100)
+            rt_log("dynlist: frame %ld dispatch %ux%ux%u prog %llu caller %#llx", fr_now, (unsigned)d->x, (unsigned)d->y,
+                   (unsigned)d->z, (unsigned long long)ex->prog->serial, (unsigned long long)d->caller);
+        if (at >= 0 && (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) == at && (long)d->x == gx) {
+            for (int j = 0; j < DYN_N; j++)
+                if (dyn_lists[NVN_STAGE_CS][j].addr)
+                    rt_log("dynlist: %d %#llx + %#llx", j, (unsigned long long)dyn_lists[NVN_STAGE_CS][j].addr,
+                           (unsigned long long)dyn_lists[NVN_STAGE_CS][j].size);
+            {   // c3 and what follows it: the culling's per-type prefix table at 0x1220-0x12c0
+                const p_bind_buf *c3 = &ex->ubo[NVN_STAGE_CS][0];
+                uint64_t n = c3->addr ? dyn_readable(c3->addr, 0x1300) : 0;
+                rt_log("dynlist: c3 %#llx size %#llx readable %#llx", (unsigned long long)c3->addr, (unsigned long long)c3->size, (unsigned long long)n);
+                {   // guest memory itself, whatever pool (if any) holds it
+                    uint64_t a = c3->addr + 0x1220, e2;
+                    int st2 = c3->addr ? plat_mem_state(a & ~0xfffull, (a & ~0xfffull) + 0x2000, &e2) : -9;
+                    rt_log("dynlist: guest page state at c3+0x1220: %d (readable when >= %d)", st2, PLAT_PROT_READ);
+                    if (st2 >= PLAT_PROT_READ)
+                        for (uint64_t o = 0x1220; o < 0x12d0; o += 0x40) {
+                            const uint32_t *w = (const uint32_t *)(uintptr_t)(c3->addr + o);
+                            rt_log("dynlist:   guest c3+%#llx %08x %08x %08x %08x | %08x %08x %08x %08x", (unsigned long long)o, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+                        }
+                }
+                uint64_t n2 = c3->addr ? dyn_readable(c3->addr + 0x1220, 0xc0) : 0;
+                rt_log("dynlist: c3+0x1220 readable in its own pool: %#llx", (unsigned long long)n2);
+                if (n2 >= 0xb0) n = 0x12d0;
+                for (uint64_t o = 0x1220; n >= 0x12d0 && o < 0x12d0; o += 0x40) {
+                    const uint32_t *w = (const uint32_t *)(uintptr_t)(c3->addr + o);
+                    rt_log("dynlist:   c3+%#llx %08x %08x %08x %08x | %08x %08x %08x %08x", (unsigned long long)o, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+                }
+            }
+            const p_bind_buf *u = &ex->ubo[NVN_STAGE_CS][1];   // c4
+            for (uint64_t o = 0; u->addr && o + 8 <= u->size && o < 0x200; o += 8) {
+                uint64_t v = *(const uint64_t *)(uintptr_t)(u->addr + o);
+                int cov = 0;
+                for (int j = 0; j < DYN_N && !cov; j++)
+                    cov = dyn_lists[NVN_STAGE_CS][j].addr && v >= dyn_lists[NVN_STAGE_CS][j].addr &&
+                          v < dyn_lists[NVN_STAGE_CS][j].addr + dyn_lists[NVN_STAGE_CS][j].size;
+                if (v) rt_log("dynlist: c4+%#llx = %#llx %s", (unsigned long long)o, (unsigned long long)v, cov ? "covered" : "NOT covered");
+                if (v && dyn_readable(v, 64) >= 64) {   // the guest's copy of the block it points to
+                    const uint32_t *w = (const uint32_t *)(uintptr_t)v;
+                    rt_log("dynlist:   %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
+                           w[8], w[9], w[10], w[11]);
+                }
+            }
+        }
+    }
     twin_dispatch = 1;
     bindless_bind(ex, info);
     bind_resources(ex, info);
     twin_dispatch = 0;
+    // LOCAL TEST (Ocarina): OOT_DISP_SNAP=<groups x>: in the dump frame, every buffer of that dispatch's reachable list (up to
+    // 4 MiB each) and its c0 bank range are copied before and after it (vk_dump_range, ds_pre_* / ds_post_* in the dump dir)
+    static long snap_gx = -2;
+    static int snapped;
+    if (snap_gx == -2) { const char *e = getenv("OOT_DISP_SNAP"); snap_gx = e ? atol(e) : -1; }
+    int snap_now = vk_dump_armed && !snapped && snap_gx > 0 && (long)d->x == snap_gx;
+    if (snap_now) {
+        extern int vk_dump_range(VkExec *, const char *, uint64_t, uint64_t);
+        snapped = 1;
+        vk_exec_barrier(ex);
+        for (int j = 0; j < DYN_N; j++)
+            if (dyn_lists[NVN_STAGE_CS][j].addr)
+                vk_dump_range(ex, "pre", dyn_lists[NVN_STAGE_CS][j].addr,
+                              dyn_lists[NVN_STAGE_CS][j].size < 0x400000 ? dyn_lists[NVN_STAGE_CS][j].size : 0x400000);
+        rt_log("vk: OOT_DISP_SNAP: dispatch %ux%ux%u program %llu snapped", (unsigned)d->x, (unsigned)d->y, (unsigned)d->z,
+               (unsigned long long)ex->prog->serial);
+    }
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
+    if (snap_now) {
+        extern int vk_dump_range(VkExec *, const char *, uint64_t, uint64_t);
+        for (int j = 0; j < DYN_N; j++)
+            if (dyn_lists[NVN_STAGE_CS][j].addr)
+                vk_dump_range(ex, "post", dyn_lists[NVN_STAGE_CS][j].addr,
+                              dyn_lists[NVN_STAGE_CS][j].size < 0x400000 ? dyn_lists[NVN_STAGE_CS][j].size : 0x400000);
+    }
     vk_prof_mark(ex, "dispatch", ex->prog ? ex->prog->serial : 0);
     ex->recorded++;
     note_work(ex, 2, (uint64_t)d->x * (uint64_t)d->y * (uint64_t)d->z);

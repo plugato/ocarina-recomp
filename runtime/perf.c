@@ -327,3 +327,52 @@ void perf_present(uint64_t frame) {
     memset(wait_ns, 0, sizeof wait_ns);
     win_start = now;
 }
+
+// ---- LOCAL TEST (Ocarina): live switches (host.h rt_live)
+#define LIVE_N 64
+static struct { char name[48], value[80]; } live[LIVE_N];
+static int nlive;
+static uint64_t live_at;
+static PlatMutex live_lock = PLAT_MUTEX_INIT;
+
+static void live_reload(const char *path) {
+    uint64_t size = 0;
+    char *text = (char *)plat_file_read(path, &size);
+    if (!text) return;
+    int n = 0;
+    for (char *line = text, *next; line && line < text + size && n < LIVE_N; line = next) {
+        next = memchr(line, '\n', (size_t)(text + size - line));
+        size_t len = next ? (size_t)(next - line) : (size_t)(text + size - line);
+        if (next) next++;
+        while (len && (line[len - 1] == '\r' || line[len - 1] == ' ')) len--;
+        char *eq = memchr(line, '=', len);
+        if (!eq || *line == '#' || eq == line) continue;
+        size_t nl = (size_t)(eq - line), vl = len - nl - 1;
+        if (nl >= sizeof live[0].name || vl >= sizeof live[0].value) continue;
+        char name[48], value[80];
+        memcpy(name, line, nl), name[nl] = 0;
+        memcpy(value, eq + 1, vl), value[vl] = 0;
+        int k = 0;
+        while (k < nlive && strcmp(live[k].name, name)) k++;
+        if (k == nlive && nlive < LIVE_N) nlive++;
+        if (k < nlive && strcmp(live[k].value, value)) rt_log("live: %s=%s", name, value);
+        if (k < nlive) memcpy(live[k].name, name, nl + 1), memcpy(live[k].value, value, vl + 1);
+        n++;
+    }
+    free(text);
+}
+
+const char *rt_live(const char *name) {
+    static const char *path;
+    static int init;
+    if (!init) path = getenv("OOT_LIVE"), init = 1;
+    if (!path || !*path) return getenv(name);
+    uint64_t now = plat_now_ms();
+    plat_mutex_lock(&live_lock);
+    if (now - live_at >= 250) live_at = now, live_reload(path);
+    const char *v = NULL;
+    for (int k = 0; k < nlive; k++)
+        if (!strcmp(live[k].name, name)) { v = live[k].value; break; }
+    plat_mutex_unlock(&live_lock);
+    return v ? v : getenv(name);
+}

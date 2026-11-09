@@ -288,6 +288,10 @@ uint64_t frame_step_ticks(void);                           // game time since th
 // compares the windows that are wholly A or wholly B).
 int rt_ab(void);
 int rt_knob(const char *name, const char *def);
+// LOCAL TEST (Ocarina): rt_live(name): the switch's value from the live file OOT_LIVE=<path> ("NAME=VALUE" lines, read
+// again every 250 ms, so a test changes it with the game running), else the environment; NULL when neither sets it.
+// The returned string stays valid; it may change under the caller between two reads.
+const char *rt_live(const char *name);
 #define RT_KNOB_ON(mode) ((mode) == 2 ? rt_ab() : (mode))
 void frame_step_present(uint64_t display_ns, int interval); // nvnQueuePresentTexture: the frame's display time and
                                                            // present interval (60 Hz ticks)

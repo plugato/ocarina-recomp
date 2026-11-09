@@ -645,8 +645,25 @@ NVN_API(nvnQueueSubmitCommands) {
     __atomic_store_n(&lod_issued, no, __ATOMIC_SEQ_CST);
     {   // LOCAL TEST (Ocarina): OOT_SUBMIT_SYNC=1: the caller waits for replay and GPU, as if the game wrote nothing behind them
         static int on = -1;
-        if (on < 0) { const char *e = getenv("OOT_SUBMIT_SYNC"); on = !(e && *e == '0'); }   // on by default: the game rewrites data the replay has not reached yet (random NaN frames otherwise)
-        if (on) gfx_backend()->fence_wait(f, 400000000);
+        static char was[16];
+        const char *e = rt_live("OOT_SUBMIT_SYNC");   // live (OOT_LIVE): on by default: the game rewrites data the replay
+        if (on < 0 || strncmp(was, e ? e : "", sizeof was - 1)) {   // has not reached yet (random NaN frames otherwise)
+            snprintf(was, sizeof was, "%s", e ? e : "");
+            on = e && !strcmp(e, "replay") ? 2 : e && !strncmp(e, "lag", 3) ? 3 + atoi(e + 3)
+               : e && !strncmp(e, "rlag", 4) ? 103 + atoi(e + 4) : !(e && *e == '0');
+        }
+        if (on >= 103) gfx_replay_wait_queued();   // =rlag<n>: the replay has recorded it, and as lag<n>
+        if (on == 2) gfx_replay_wait_queued();   // =replay: the replay has recorded it, the GPU may still run it
+        else if (on >= 3) {   // =lag<n>: the GPU may still run the last n submissions
+            enum { LAGS = 16 };
+            static uint64_t ring[LAGS];
+            static unsigned at;
+            int lag = (on >= 103 ? on - 103 : on - 3) < LAGS ? (on >= 103 ? on - 103 : on - 3) : LAGS - 1;
+            ring[at++ % LAGS] = f;
+            uint64_t w = at > (unsigned)lag ? ring[(at - 1 - lag) % LAGS] : 0;
+            if (lag == 0) gfx_backend()->fence_wait(f, 400000000);
+            else if (w && gfx_backend()->fence_done() < w) gfx_backend()->fence_wait(w, 400000000);
+        } else if (on) gfx_backend()->fence_wait(f, 400000000);
     }
 }
 

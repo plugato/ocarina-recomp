@@ -508,7 +508,16 @@ static void game_defaults(void) {
         {"TOTK_GPL", "0"},
         {"TOTK_ASYNC_PREEMPT", "0"},
         {"DKB_SKIP_CS", "dec1feb3c7fa967a,3f6f2b1d671badcd"},
-        {"OOT_EV", "-1.25"},   // boot.c oot_exposure: the views' exposure, which nothing here writes (washed-out picture)
+        // LOCAL TEST: the washed-out picture came from OOT_SUBMIT_SYNC's full wait (below), not from a missing exposure:
+        // with the GPU allowed three submissions behind, the forest matches Eglantine with no correction (luma 60 vs 58;
+        // full wait 115, full wait and EV -1.25 71). OOT_EV=-1.25 brings the old correction back.
+        {"OOT_EV", "0"},
+        // nvn_api_core.c: the guest waits for the GPU three submissions back, not for its own submission (lag2 and below
+        // wash the picture out, lag6 and above flicker): Kokiri Forest 34 -> 50 fps on an RTX 3070.
+        {"OOT_SUBMIT_SYNC", "lag3"},
+        // vk_memory.c: storage written by shaders goes back to guest memory word by word up to 16 MiB (was 4): a plain
+        // copy of 8 MiB guarded bindings wrote 45 MiB a frame over PCIe and over the CPU's newer bytes.
+        {"OOT_MERGE_MAX_MIB", "16"},
     };
     for (size_t i = 0; i < sizeof d / sizeof *d; i++) {
         if (getenv(d[i][0])) continue;

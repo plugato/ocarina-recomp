@@ -341,6 +341,8 @@ static void replay_drain(int why) {
     plat_mutex_unlock(&rl);
 }
 
+void gfx_replay_wait_queued(void) { replay_drain(DR_FINISH); }   // LOCAL TEST (Ocarina): OOT_SUBMIT_SYNC=replay
+
 // What made the game wait for the replay: since the last line (every 1800 game frames), or over the run (at exit).
 static void replay_log(uint64_t frame, int total) {
     char buf[1024];
